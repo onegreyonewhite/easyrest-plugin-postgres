@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+
+      - name: Build Release Binaries
+        run: |
+          mkdir -p release
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              echo "Building for $os/$arch..."
+              GOOS=$os GOARCH=$arch go build -o release/easyrest-plugin-mysql-$os-$arch mysql_plugin.go
+            done
+          done
+
+      - name: Get Commit Message (without first line)
+        id: commit
+        run: |
+          COMMIT_BODY=$(git log -1 --pretty=format:"%b")
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.commit.outputs.message }}
+          artifacts: release/*
