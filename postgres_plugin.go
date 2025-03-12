@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"time"
@@ -27,7 +26,6 @@ type pgPlugin struct {
 
 // InitConnection opens a PostgreSQL connection using a URI with the prefix "postgres://".
 func (p *pgPlugin) InitConnection(uri string) error {
-	// Validate URI prefix and convert to PostgreSQL DSN.
 	if !strings.HasPrefix(uri, "postgres://") {
 		return errors.New("invalid postgres URI")
 	}
@@ -36,7 +34,6 @@ func (p *pgPlugin) InitConnection(uri string) error {
 	if err != nil {
 		return err
 	}
-	// Set connection pool parameters.
 	db.SetMaxOpenConns(50)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -47,82 +44,49 @@ func (p *pgPlugin) InitConnection(uri string) error {
 	return nil
 }
 
-// ApplyPluginContext sets context variables in PostgreSQL using set_config.
-// For each key in ctx, two settings are applied: "request.<key>" and "erctx.<key>".
-// If the value is a map, slice, or array, it is serialized to JSON.
+// ApplyPluginContext sets session variables using set_config for all keys in ctx.
+// For each key, it sets two variables: one with prefix "request." (complex types are marshaled to JSON)
+// and one with prefix "erctx." using the default string representation.
+// Keys are processed in sorted order to ensure deterministic behavior.
 func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
-	for key, val := range ctx {
-		var valStr string
-		switch v := val.(type) {
-		case string:
-			valStr = v
-		case int, int32, int64, float32, float64, bool:
-			valStr = fmt.Sprintf("%v", v)
-		default:
-			// Serialize complex types to JSON.
-			b, err := json.Marshal(v)
+	// Collect and sort keys.
+	keys := make([]string, 0, len(ctx))
+	for k := range ctx {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := ctx[key]
+		var requestVal string
+		switch val.(type) {
+		case map[string]interface{}, []interface{}:
+			b, err := json.Marshal(val)
 			if err != nil {
 				return err
 			}
-			valStr = string(b)
+			requestVal = string(b)
+		default:
+			requestVal = fmt.Sprintf("%v", val)
 		}
-		// Set for request.<key>
+		erctxVal := fmt.Sprintf("%v", val)
 		query := "SELECT set_config($1, $2, true)"
-		requestKey := "request." + key
-		if _, err := tx.ExecContext(context.Background(), query, requestKey, valStr); err != nil {
+		if _, err := tx.ExecContext(context.Background(), query, "request."+key, requestVal); err != nil {
 			return err
 		}
-		// Set for erctx.<key>
-		erctxKey := "erctx." + key
-		if _, err := tx.ExecContext(context.Background(), query, erctxKey, valStr); err != nil {
+		if _, err := tx.ExecContext(context.Background(), query, "erctx."+key, erctxVal); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// TableGet executes a SELECT query with optional WHERE, GROUP BY, ORDER BY, LIMIT, and OFFSET.
-// It now also processes selectFields: any field starting with "erctx." is replaced by a literal
-// value from the context (if available) using a placeholder and alias.
+// TableGet executes a SELECT query with optional WHERE, GROUP BY, ORDER BY, LIMIT and OFFSET.
 func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where map[string]interface{},
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]interface{}) ([]map[string]interface{}, error) {
 
-	var flatCtx map[string]string
-	var err error
-	var selectArgs []interface{}
-	if ctx != nil {
-		flatCtx, err = easyrest.FormatToContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		// Substitute context values in the WHERE clause.
-		substituted := substituteContextValues(where, flatCtx)
-		if m, ok := substituted.(map[string]interface{}); ok {
-			where = m
-		} else {
-			return nil, fmt.Errorf("expected map[string]interface{} after substitution")
-		}
-	}
-	var fields string
+	fields := "*"
 	if len(selectFields) > 0 {
-		newSelectFields := make([]string, 0, len(selectFields))
-		for _, field := range selectFields {
-			// If the field begins with "erctx." and context has a corresponding value,
-			// replace the field with a literal placeholder and alias.
-			if flatCtx != nil && strings.HasPrefix(field, "erctx.") {
-				key := strings.TrimPrefix(field, "erctx.")
-				normalizedKey := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
-				if val, exists := flatCtx[normalizedKey]; exists {
-					newSelectFields = append(newSelectFields, fmt.Sprintf("? AS %s", field))
-					selectArgs = append(selectArgs, val)
-					continue
-				}
-			}
-			newSelectFields = append(newSelectFields, field)
-		}
-		fields = strings.Join(newSelectFields, ", ")
-	} else {
-		fields = "*"
+		fields = strings.Join(selectFields, ", ")
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", fields, table)
 	whereClause, args, err := easyrest.BuildWhereClause(where)
@@ -142,31 +106,34 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 	if offset > 0 {
 		query += fmt.Sprintf(" OFFSET %d", offset)
 	}
-	// Convert "?" placeholders to PostgreSQL format.
 	query = convertPlaceholders(query)
-	combinedArgs := append(selectArgs, args...)
-	log.Println(query)
-	log.Println(combinedArgs)
 
-	// Begin a transaction to apply context variables.
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
 	}
+
+	loc := time.UTC
 	if ctx != nil {
 		if err := ApplyPluginContext(tx, ctx); err != nil {
 			tx.Rollback()
 			return nil, err
 		}
+		if tz, ok := ctx["timezone"].(string); ok && tz != "" {
+			if l, err := time.LoadLocation(tz); err == nil {
+				loc = l
+			}
+		}
 	}
-	rows, err := tx.QueryContext(context.Background(), query, combinedArgs...)
+
+	rows, err := tx.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		tx.Rollback()
 		return nil, err
 	}
-	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
+		rows.Close()
 		tx.Rollback()
 		return nil, err
 	}
@@ -179,17 +146,18 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 			columnPointers[i] = &columns[i]
 		}
 		if err := rows.Scan(columnPointers...); err != nil {
+			rows.Close()
 			tx.Rollback()
 			return nil, err
 		}
 		rowMap := make(map[string]interface{}, numCols)
 		for i, colName := range cols {
-			// Format time values appropriately.
 			if t, ok := columns[i].(time.Time); ok {
-				if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
-					rowMap[colName] = t.Format("2006-01-02")
+				adjusted := t.In(loc)
+				if adjusted.Hour() == 0 && adjusted.Minute() == 0 && adjusted.Second() == 0 && adjusted.Nanosecond() == 0 {
+					rowMap[colName] = adjusted.Format("2006-01-02")
 				} else {
-					rowMap[colName] = t.Format("2006-01-02 15:04:05")
+					rowMap[colName] = adjusted.Format("2006-01-02 15:04:05")
 				}
 			} else {
 				rowMap[colName] = columns[i]
@@ -197,14 +165,19 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 		}
 		results = append(results, rowMap)
 	}
+	rows.Close() // Close rows synchronously
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return results, nil
 }
 
-// TableCreate performs an INSERT operation on the specified table.
+// TableCreate performs an INSERT operation on the specified table,
+// inserting all rows in one SQL statement.
 func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+	if len(data) == 0 {
+		return []map[string]interface{}{}, nil
+	}
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
@@ -215,50 +188,34 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 			return nil, err
 		}
 	}
-	var results []map[string]interface{}
-	var flatCtx map[string]string
-	if ctx != nil {
-		flatCtx, err = easyrest.FormatToContext(ctx)
-		if err != nil {
-			tx.Rollback()
-			return nil, err
-		}
+	// Use keys from the first row.
+	keys := make([]string, 0, len(data[0]))
+	for k := range data[0] {
+		keys = append(keys, k)
 	}
-	// Process each row for insertion.
+	sort.Strings(keys)
+	colsStr := strings.Join(keys, ", ")
+	// Build placeholders for each row.
+	var valuePlaceholders []string
+	var args []interface{}
 	for _, row := range data {
-		substituted := substituteContextValues(row, flatCtx)
-		rowMap, ok := substituted.(map[string]interface{})
-		if !ok {
-			tx.Rollback()
-			return nil, fmt.Errorf("failed to substitute context in row")
-		}
-		// Sort keys for deterministic order.
-		keys := make([]string, 0, len(rowMap))
-		for k := range rowMap {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var cols []string
-		var placeholders []string
-		var args []interface{}
+		var ph []string
 		for _, k := range keys {
-			cols = append(cols, k)
-			placeholders = append(placeholders, "?")
-			args = append(args, rowMap[k])
+			ph = append(ph, "?")
+			args = append(args, row[k])
 		}
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		query = convertPlaceholders(query)
-		_, err := tx.ExecContext(context.Background(), query, args...)
-		if err != nil {
-			tx.Rollback()
-			return nil, err
-		}
-		results = append(results, rowMap)
+		valuePlaceholders = append(valuePlaceholders, "("+strings.Join(ph, ", ")+")")
+	}
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, colsStr, strings.Join(valuePlaceholders, ", "))
+	query = convertPlaceholders(query)
+	if _, err := tx.ExecContext(context.Background(), query, args...); err != nil {
+		tx.Rollback()
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return results, nil
+	return data, nil
 }
 
 // TableUpdate executes an UPDATE query on the specified table.
@@ -273,32 +230,14 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]interface{}
 			return 0, err
 		}
 	}
-	var flatCtx map[string]string
-	if ctx != nil {
-		flatCtx, err = easyrest.FormatToContext(ctx)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-	}
-	substitutedData, ok := substituteContextValues(data, flatCtx).(map[string]interface{})
-	if !ok {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to substitute context in data")
-	}
-	substitutedWhere, ok := substituteContextValues(where, flatCtx).(map[string]interface{})
-	if !ok {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to substitute context in where")
-	}
 	var setParts []string
 	var args []interface{}
-	for k, v := range substitutedData {
+	for k, v := range data {
 		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
 		args = append(args, v)
 	}
 	query := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
-	whereClause, whereArgs, err := easyrest.BuildWhereClause(substitutedWhere)
+	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
 	if err != nil {
 		tx.Rollback()
 		return 0, err
@@ -334,20 +273,7 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]interface{
 			return 0, err
 		}
 	}
-	var flatCtx map[string]string
-	if ctx != nil {
-		flatCtx, err = easyrest.FormatToContext(ctx)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-	}
-	substitutedWhere, ok := substituteContextValues(where, flatCtx).(map[string]interface{})
-	if !ok {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to substitute context in where")
-	}
-	whereClause, args, err := easyrest.BuildWhereClause(substitutedWhere)
+	whereClause, args, err := easyrest.BuildWhereClause(where)
 	if err != nil {
 		tx.Rollback()
 		return 0, err
@@ -371,10 +297,8 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]interface{
 }
 
 // CallFunction executes a function call using SELECT syntax.
-// It orders the parameters by key to ensure a deterministic order, substitutes context values,
-// and executes the function call inside a transaction with context variables applied.
+// Parameters are passed in sorted order by key.
 func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interface{}, ctx map[string]interface{}) (interface{}, error) {
-	// Sort parameter keys.
 	keys := make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
@@ -382,35 +306,12 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interfa
 	sort.Strings(keys)
 	var placeholders []string
 	var args []interface{}
-	var flatCtx map[string]string
-	var err error
-	if ctx != nil {
-		flatCtx, err = easyrest.FormatToContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// Process each parameter.
 	for _, k := range keys {
-		v := data[k]
-		if s, ok := v.(string); ok && strings.HasPrefix(s, "erctx.") {
-			key := strings.ToLower(strings.TrimPrefix(s, "erctx."))
-			if flatCtx != nil {
-				if val, exists := flatCtx[key]; exists {
-					placeholders = append(placeholders, "?")
-					args = append(args, val)
-					continue
-				}
-			}
-		}
 		placeholders = append(placeholders, "?")
-		args = append(args, v)
+		args = append(args, data[k])
 	}
-	// Build function call query.
 	query := fmt.Sprintf("SELECT %s(%s) AS result", funcName, strings.Join(placeholders, ", "))
 	query = convertPlaceholders(query)
-
-	// Begin transaction and apply context variables.
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
@@ -426,12 +327,13 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interfa
 		tx.Rollback()
 		return nil, err
 	}
-	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
+		rows.Close()
 		tx.Rollback()
 		return nil, err
 	}
+	var result interface{}
 	if rows.Next() {
 		columns := make([]interface{}, len(cols))
 		columnPointers := make([]interface{}, len(cols))
@@ -439,49 +341,22 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interfa
 			columnPointers[i] = &columns[i]
 		}
 		if err := rows.Scan(columnPointers...); err != nil {
+			rows.Close()
 			tx.Rollback()
 			return nil, err
 		}
 		if len(columns) > 0 {
-			tx.Commit()
-			return columns[0], nil
+			result = columns[0]
 		}
 	}
-	tx.Commit()
-	return nil, nil
-}
-
-// substituteContextValues recursively replaces strings starting with "erctx." using flatCtx.
-func substituteContextValues(input interface{}, flatCtx map[string]string) interface{} {
-	switch v := input.(type) {
-	case string:
-		if strings.HasPrefix(v, "erctx.") {
-			key := strings.TrimPrefix(v, "erctx.")
-			normalizedKey := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
-			if val, exists := flatCtx[normalizedKey]; exists {
-				return val
-			}
-			return v
-		}
-		return v
-	case map[string]interface{}:
-		m := make(map[string]interface{})
-		for key, value := range v {
-			m[key] = substituteContextValues(value, flatCtx)
-		}
-		return m
-	case []interface{}:
-		s := make([]interface{}, len(v))
-		for i, item := range v {
-			s[i] = substituteContextValues(item, flatCtx)
-		}
-		return s
-	default:
-		return v
+	rows.Close() // Synchronously close rows
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
+	return result, nil
 }
 
-// convertPlaceholders replaces each "?" in the query with PostgreSQL-style "$1", "$2", ...
+// convertPlaceholders replaces each "?" in the query with PostgreSQL-style "$1", "$2", etc.
 func convertPlaceholders(query string) string {
 	var builder strings.Builder
 	counter := 1
@@ -496,6 +371,197 @@ func convertPlaceholders(query string) string {
 	return builder.String()
 }
 
+// GetSchema returns a schema object with "tables" and "rpc" keys.
+// It applies the provided context to the session before retrieving the schema.
+func (p *pgPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
+	tx, err := p.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		if err := ApplyPluginContext(tx, ctx); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+	}
+	tables, err := p.getTablesSchema(tx)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	rpc, err := p.getRPCSchema(tx)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"tables": tables,
+		"rpc":    rpc,
+	}, nil
+}
+
+// getTablesSchema builds a schema for each table from information_schema.
+func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	tableQuery := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+	rows, err := tx.QueryContext(context.Background(), tableQuery)
+	if err != nil {
+		return nil, err
+	}
+	var tableNames []string
+	for rows.Next() {
+		var tn string
+		if err := rows.Scan(&tn); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tableNames = append(tableNames, tn)
+	}
+	rows.Close()
+	for _, tn := range tableNames {
+		colQuery := "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
+		colRows, err := tx.QueryContext(context.Background(), colQuery, tn)
+		if err != nil {
+			return nil, err
+		}
+		properties := make(map[string]interface{})
+		var required []string
+		for colRows.Next() {
+			var colName, dataType, isNullable string
+			var colDefault sql.NullString
+			if err := colRows.Scan(&colName, &dataType, &isNullable, &colDefault); err != nil {
+				colRows.Close()
+				return nil, err
+			}
+			swType := mapPostgresType(dataType)
+			prop := map[string]interface{}{
+				"type": swType,
+			}
+			if isNullable == "YES" {
+				prop["x-nullable"] = true
+			}
+			if isNullable == "NO" && !colDefault.Valid {
+				required = append(required, colName)
+			}
+			properties[colName] = prop
+		}
+		colRows.Close()
+		schema := map[string]interface{}{
+			"type":       "object",
+			"properties": properties,
+		}
+		if len(required) > 0 {
+			schema["required"] = required
+		}
+		result[tn] = schema
+	}
+	return result, nil
+}
+
+// getRPCSchema builds schemas for stored functions.
+func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	// Use specific_name as unique identifier.
+	rpcQuery := "SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'"
+	rows, err := tx.QueryContext(context.Background(), rpcQuery)
+	if err != nil {
+		return nil, err
+	}
+	var routines []struct {
+		routineName  string
+		specificName string
+		returnType   string
+	}
+	for rows.Next() {
+		var rn, sn, rt string
+		if err := rows.Scan(&rn, &sn, &rt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		routines = append(routines, struct {
+			routineName  string
+			specificName string
+			returnType   string
+		}{rn, sn, rt})
+	}
+	rows.Close()
+	for _, r := range routines {
+		paramQuery := "SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters WHERE specific_schema = 'public' AND specific_name = $1 ORDER BY ordinal_position"
+		paramRows, err := tx.QueryContext(context.Background(), paramQuery, r.specificName)
+		if err != nil {
+			return nil, err
+		}
+		properties := make(map[string]interface{})
+		var reqFields []string
+		for paramRows.Next() {
+			var paramName sql.NullString
+			var dataType, paramMode string
+			var ordinal int
+			if err := paramRows.Scan(&paramName, &dataType, &paramMode, &ordinal); err != nil {
+				paramRows.Close()
+				return nil, err
+			}
+			if !paramName.Valid {
+				continue
+			}
+			swType := mapPostgresType(dataType)
+			prop := map[string]interface{}{
+				"type": swType,
+			}
+			properties[paramName.String] = prop
+			reqFields = append(reqFields, paramName.String)
+		}
+		paramRows.Close()
+		inSchema := map[string]interface{}{
+			"type":       "object",
+			"properties": properties,
+		}
+		if len(reqFields) > 0 {
+			inSchema["required"] = reqFields
+		}
+		outSchema := map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		}
+		if strings.ToLower(r.returnType) != "void" {
+			outSchema["properties"] = map[string]interface{}{
+				"result": map[string]interface{}{
+					"type": mapPostgresType(r.returnType),
+				},
+			}
+		}
+		result[r.routineName] = []interface{}{inSchema, outSchema}
+	}
+	return result, nil
+}
+
+// mapPostgresType converts a PostgreSQL data type to a JSON schema type.
+func mapPostgresType(dt string) string {
+	up := strings.ToUpper(dt)
+	if strings.Contains(up, "INT") {
+		return "integer"
+	}
+	if strings.Contains(up, "CHAR") || strings.Contains(up, "TEXT") {
+		return "string"
+	}
+	if strings.Contains(up, "BOOL") {
+		return "boolean"
+	}
+	if strings.Contains(up, "DATE") {
+		return "string"
+	}
+	if strings.Contains(up, "TIME") {
+		return "string"
+	}
+	if strings.Contains(up, "NUMERIC") || strings.Contains(up, "DECIMAL") || strings.Contains(up, "REAL") || strings.Contains(up, "DOUBLE") {
+		return "number"
+	}
+	return "string"
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -504,7 +570,7 @@ func main() {
 		return
 	}
 	impl := &pgPlugin{}
-	// Serve the plugin using the go-plugin framework.
+	// Serve the plugin using go-plugin.
 	hplugin.Serve(&hplugin.ServeConfig{
 		HandshakeConfig: easyrest.Handshake,
 		Plugins: map[string]hplugin.Plugin{

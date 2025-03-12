@@ -1,4 +1,3 @@
-```markdown
 # EasyREST PostgreSQL Plugin
 
 The **EasyREST PostgreSQL Plugin** is an external plugin for [EasyREST](https://github.com/onegreyonewhite/easyrest) that enables EasyREST to connect to and perform CRUD operations on PostgreSQL databases. This plugin implements the `easyrest.DBPlugin` interface using a PostgreSQL connection pool, context-based value substitution, and transactional function execution.
