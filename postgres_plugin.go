@@ -17,7 +17,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.1.0"
+var Version = "v0.2.0"
 
 // pgPlugin implements the DBPlugin interface for PostgreSQL.
 type pgPlugin struct {
@@ -47,7 +47,7 @@ func (p *pgPlugin) InitConnection(uri string) error {
 // ApplyPluginContext sets session variables using set_config for all keys in ctx.
 // For each key, it sets two variables: one with prefix "request." (complex types are marshaled to JSON)
 // and one with prefix "erctx." using the default string representation.
-// Keys are processed in sorted order to ensure deterministic behavior.
+// Keys are processed in sorted order.
 func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
 	// Collect and sort keys.
 	keys := make([]string, 0, len(ctx))
@@ -172,8 +172,7 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 	return results, nil
 }
 
-// TableCreate performs an INSERT operation on the specified table,
-// inserting all rows in one SQL statement.
+// TableCreate performs an INSERT operation on the specified table
 func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
 	if len(data) == 0 {
 		return []map[string]interface{}{}, nil
@@ -188,14 +187,14 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 			return nil, err
 		}
 	}
-	// Use keys from the first row.
+
 	keys := make([]string, 0, len(data[0]))
 	for k := range data[0] {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	colsStr := strings.Join(keys, ", ")
-	// Build placeholders for each row.
+
 	var valuePlaceholders []string
 	var args []interface{}
 	for _, row := range data {
@@ -371,42 +370,10 @@ func convertPlaceholders(query string) string {
 	return builder.String()
 }
 
-// GetSchema returns a schema object with "tables" and "rpc" keys.
-// It applies the provided context to the session before retrieving the schema.
-func (p *pgPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
-	tx, err := p.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		return nil, err
-	}
-	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
-			return nil, err
-		}
-	}
-	tables, err := p.getTablesSchema(tx)
-	if err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	rpc, err := p.getRPCSchema(tx)
-	if err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{
-		"tables": tables,
-		"rpc":    rpc,
-	}, nil
-}
-
-// getTablesSchema builds a schema for each table from information_schema.
+// getTablesSchema builds a schema for each base table from information_schema.
 func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
-	tableQuery := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+	tableQuery := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
 	rows, err := tx.QueryContext(context.Background(), tableQuery)
 	if err != nil {
 		return nil, err
@@ -461,10 +428,67 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 	return result, nil
 }
 
+// getViewsSchema builds a schema for each view from information_schema.
+func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'"
+	rows, err := tx.QueryContext(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+	var viewNames []string
+	for rows.Next() {
+		var vn string
+		if err := rows.Scan(&vn); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		viewNames = append(viewNames, vn)
+	}
+	rows.Close()
+	for _, vn := range viewNames {
+		colQuery := "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
+		colRows, err := tx.QueryContext(context.Background(), colQuery, vn)
+		if err != nil {
+			return nil, err
+		}
+		properties := make(map[string]interface{})
+		var required []string
+		for colRows.Next() {
+			var colName, dataType, isNullable string
+			var colDefault sql.NullString
+			if err := colRows.Scan(&colName, &dataType, &isNullable, &colDefault); err != nil {
+				colRows.Close()
+				return nil, err
+			}
+			swType := mapPostgresType(dataType)
+			prop := map[string]interface{}{
+				"type": swType,
+			}
+			if isNullable == "YES" {
+				prop["x-nullable"] = true
+			}
+			if isNullable == "NO" && !colDefault.Valid {
+				required = append(required, colName)
+			}
+			properties[colName] = prop
+		}
+		colRows.Close()
+		schema := map[string]interface{}{
+			"type":       "object",
+			"properties": properties,
+		}
+		if len(required) > 0 {
+			schema["required"] = required
+		}
+		result[vn] = schema
+	}
+	return result, nil
+}
+
 // getRPCSchema builds schemas for stored functions.
 func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
-	// Use specific_name as unique identifier.
 	rpcQuery := "SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'"
 	rows, err := tx.QueryContext(context.Background(), rpcQuery)
 	if err != nil {
@@ -562,6 +586,44 @@ func mapPostgresType(dt string) string {
 	return "string"
 }
 
+// GetSchema returns a schema object with "tables", "views" and "rpc" keys.
+// It applies the provided context to the session before retrieving the schema.
+func (p *pgPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
+	tx, err := p.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		if err := ApplyPluginContext(tx, ctx); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+	}
+	tables, err := p.getTablesSchema(tx)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	views, err := p.getViewsSchema(tx)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	rpc, err := p.getRPCSchema(tx)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"tables": tables,
+		"views":  views,
+		"rpc":    rpc,
+	}, nil
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -570,7 +632,6 @@ func main() {
 		return
 	}
 	impl := &pgPlugin{}
-	// Serve the plugin using go-plugin.
 	hplugin.Serve(&hplugin.ServeConfig{
 		HandshakeConfig: easyrest.Handshake,
 		Plugins: map[string]hplugin.Plugin{
