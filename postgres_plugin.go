@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -17,30 +18,136 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.2.0"
+var Version = "v0.2.1"
+
+type sqlOpener interface {
+	Open(driverName, dataSourceName string) (*sql.DB, error)
+}
+
+type defaultSQLOpener struct{}
+
+func (o *defaultSQLOpener) Open(driverName, dataSourceName string) (*sql.DB, error) {
+	return sql.Open(driverName, dataSourceName)
+}
+
+// Add interface for testing purposes
+type sqlDB interface {
+	SetMaxOpenConns(n int)
+	SetMaxIdleConns(n int)
+	SetConnMaxLifetime(d time.Duration)
+	SetConnMaxIdleTime(d time.Duration)
+	Ping() error
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+	Close() error
+}
 
 // pgPlugin implements the DBPlugin interface for PostgreSQL.
 type pgPlugin struct {
-	db *sql.DB
+	db             sqlDB
+	opener         sqlOpener
+	defaultTimeout time.Duration // Default timeout for operations
+	bulkThreshold  int           // Threshold for bulk operations
+}
+
+// newContextWithTimeout creates a new context with timeout
+func (p *pgPlugin) newContextWithTimeout() (context.Context, context.CancelFunc) {
+	if p.defaultTimeout == 0 {
+		p.defaultTimeout = 30 * time.Second
+	}
+	return context.WithTimeout(context.Background(), p.defaultTimeout)
 }
 
 // InitConnection opens a PostgreSQL connection using a URI with the prefix "postgres://".
 func (p *pgPlugin) InitConnection(uri string) error {
+	if p.opener == nil {
+		p.opener = &defaultSQLOpener{}
+	}
+
 	if !strings.HasPrefix(uri, "postgres://") {
 		return errors.New("invalid postgres URI")
 	}
-	dsn := "postgres://" + strings.TrimPrefix(uri, "postgres://")
-	db, err := sql.Open("postgres", dsn)
+
+	parsedURI, err := url.Parse(uri)
 	if err != nil {
 		return err
 	}
-	db.SetMaxOpenConns(50)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	if err := db.Ping(); err != nil {
+
+	queryParams := parsedURI.Query()
+	maxOpenConns := 100
+	maxIdleConns := 25
+	connMaxLifetime := 5
+	connMaxIdleTime := 10
+	timeout := 30        // Timeout in seconds
+	bulkThreshold := 100 // Threshold for bulk operations
+
+	// Remove connection parameters from query before creating DSN
+	if val := queryParams.Get("maxOpenConns"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &maxOpenConns); err != nil || n != 1 {
+			return fmt.Errorf("invalid maxOpenConns value: %s", val)
+		}
+	}
+	queryParams.Del("maxOpenConns")
+
+	if val := queryParams.Get("maxIdleConns"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &maxIdleConns); err != nil || n != 1 {
+			return fmt.Errorf("invalid maxIdleConns value: %s", val)
+		}
+	}
+	queryParams.Del("maxIdleConns")
+
+	if val := queryParams.Get("connMaxLifetime"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &connMaxLifetime); err != nil || n != 1 {
+			return fmt.Errorf("invalid connMaxLifetime value: %s", val)
+		}
+	}
+	queryParams.Del("connMaxLifetime")
+
+	if val := queryParams.Get("connMaxIdleTime"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &connMaxIdleTime); err != nil || n != 1 {
+			return fmt.Errorf("invalid connMaxIdleTime value: %s", val)
+		}
+	}
+	queryParams.Del("connMaxIdleTime")
+
+	if val := queryParams.Get("timeout"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &timeout); err != nil || n != 1 {
+			return fmt.Errorf("invalid timeout value: %s", val)
+		}
+	}
+	queryParams.Del("timeout")
+
+	if val := queryParams.Get("bulkThreshold"); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &bulkThreshold); err != nil || n != 1 {
+			return fmt.Errorf("invalid bulkThreshold value: %s", val)
+		}
+	}
+	queryParams.Del("bulkThreshold")
+
+	parsedURI.RawQuery = queryParams.Encode()
+	dsn := parsedURI.String()
+
+	db, err := p.opener.Open("postgres", dsn)
+	if err != nil {
 		return err
 	}
-	p.db = db
+
+	if db != nil {
+		db.SetMaxOpenConns(maxOpenConns)
+		db.SetMaxIdleConns(maxIdleConns)
+		db.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Minute)
+		db.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Minute)
+		p.defaultTimeout = time.Duration(timeout) * time.Second
+		p.bulkThreshold = bulkThreshold
+
+		ctx, cancel := p.newContextWithTimeout()
+		defer cancel()
+
+		if err := db.PingContext(ctx); err != nil {
+			return err
+		}
+		p.db = db
+	}
+
 	return nil
 }
 
@@ -80,9 +187,68 @@ func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
 	return nil
 }
 
+// processRows processes query results in batches
+func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string]interface{}, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	numCols := len(cols)
+
+	// Pre-allocate memory for results
+	results := make([]map[string]interface{}, 0, 1000)
+
+	// Reuse slices for scanning
+	columns := make([]interface{}, numCols)
+	columnPointers := make([]interface{}, numCols)
+	for i := range columns {
+		columnPointers[i] = &columns[i]
+	}
+
+	// Process results in batches
+	const batchSize = 1000
+	batch := make([]map[string]interface{}, 0, batchSize)
+
+	for rows.Next() {
+		if err := rows.Scan(columnPointers...); err != nil {
+			return nil, err
+		}
+
+		rowMap := make(map[string]interface{}, numCols)
+		for i, colName := range cols {
+			if t, ok := columns[i].(time.Time); ok {
+				adjusted := t.In(loc)
+				if adjusted.Hour() == 0 && adjusted.Minute() == 0 && adjusted.Second() == 0 && adjusted.Nanosecond() == 0 {
+					rowMap[colName] = adjusted.Format("2006-01-02")
+				} else {
+					rowMap[colName] = adjusted.Format("2006-01-02 15:04:05")
+				}
+			} else {
+				rowMap[colName] = columns[i]
+			}
+		}
+
+		batch = append(batch, rowMap)
+		if len(batch) >= batchSize {
+			results = append(results, batch...)
+			batch = batch[:0] // Clear batch while preserving allocated memory
+		}
+	}
+
+	// Add remaining results
+	if len(batch) > 0 {
+		results = append(results, batch...)
+	}
+
+	return results, nil
+}
+
 // TableGet executes a SELECT query with optional WHERE, GROUP BY, ORDER BY, LIMIT and OFFSET.
 func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where map[string]interface{},
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+
+	queryCtx, cancel := p.newContextWithTimeout()
+	defer cancel()
 
 	fields := "*"
 	if len(selectFields) > 0 {
@@ -108,7 +274,10 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 	}
 	query = convertPlaceholders(query)
 
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
+		ReadOnly:  true,
+		Isolation: sql.LevelReadCommitted,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -126,49 +295,23 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 		}
 	}
 
-	rows, err := tx.QueryContext(context.Background(), query, args...)
+	rows, err := tx.QueryContext(queryCtx, query, args...)
 	if err != nil {
 		tx.Rollback()
 		return nil, err
 	}
-	cols, err := rows.Columns()
+	defer rows.Close()
+
+	results, err := p.processRows(rows, loc)
 	if err != nil {
-		rows.Close()
 		tx.Rollback()
 		return nil, err
 	}
-	numCols := len(cols)
-	var results []map[string]interface{}
-	for rows.Next() {
-		columns := make([]interface{}, numCols)
-		columnPointers := make([]interface{}, numCols)
-		for i := range columns {
-			columnPointers[i] = &columns[i]
-		}
-		if err := rows.Scan(columnPointers...); err != nil {
-			rows.Close()
-			tx.Rollback()
-			return nil, err
-		}
-		rowMap := make(map[string]interface{}, numCols)
-		for i, colName := range cols {
-			if t, ok := columns[i].(time.Time); ok {
-				adjusted := t.In(loc)
-				if adjusted.Hour() == 0 && adjusted.Minute() == 0 && adjusted.Second() == 0 && adjusted.Nanosecond() == 0 {
-					rowMap[colName] = adjusted.Format("2006-01-02")
-				} else {
-					rowMap[colName] = adjusted.Format("2006-01-02 15:04:05")
-				}
-			} else {
-				rowMap[colName] = columns[i]
-			}
-		}
-		results = append(results, rowMap)
-	}
-	rows.Close() // Close rows synchronously
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+
 	return results, nil
 }
 
@@ -177,6 +320,12 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 	if len(data) == 0 {
 		return []map[string]interface{}{}, nil
 	}
+
+	// Use COPY for large datasets
+	if len(data) >= p.bulkThreshold {
+		return p.bulkCreate(table, data, ctx)
+	}
+
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
@@ -214,6 +363,68 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	return data, nil
+}
+
+// bulkCreate uses COPY for efficient insertion of large amounts of data
+func (p *pgPlugin) bulkCreate(table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+	tx, err := p.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		if err := ApplyPluginContext(tx, ctx); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+	}
+
+	// Get column list
+	keys := make([]string, 0, len(data[0]))
+	for k := range data[0] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Create temporary table for COPY
+	tempTable := fmt.Sprintf("temp_%s_%d", table, time.Now().UnixNano())
+	createTempSQL := fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s) ON COMMIT DROP", tempTable, table)
+	if _, err := tx.ExecContext(context.Background(), createTempSQL); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to create temp table: %v", err)
+	}
+
+	// Prepare COPY statement
+	stmt, err := tx.PrepareContext(context.Background(), fmt.Sprintf("COPY %s (%s) FROM STDIN", tempTable, strings.Join(keys, ", ")))
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to prepare COPY statement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Copy data
+	for _, row := range data {
+		values := make([]interface{}, len(keys))
+		for i, key := range keys {
+			values[i] = row[key]
+		}
+		if _, err := stmt.ExecContext(context.Background(), values...); err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("failed to copy row: %v", err)
+		}
+	}
+
+	// Insert data from temporary table into target
+	insertSQL := fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", table, tempTable)
+	if _, err := tx.ExecContext(context.Background(), insertSQL); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to insert from temp table: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return data, nil
 }
 

@@ -2,7 +2,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -10,6 +12,38 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
+
+// Mock for DB
+type mockDB struct {
+	maxOpenConns    int
+	maxIdleConns    int
+	connMaxLifetime time.Duration
+}
+
+func (m *mockDB) SetMaxOpenConns(n int) {
+	m.maxOpenConns = n
+}
+
+func (m *mockDB) SetMaxIdleConns(n int) {
+	m.maxIdleConns = n
+}
+
+func (m *mockDB) SetConnMaxLifetime(d time.Duration) {
+	m.connMaxLifetime = d
+}
+
+func (m *mockDB) Ping() error {
+	return nil
+}
+
+// Mock for opener
+type mockSQLOpener struct {
+	mockDB *sql.DB
+}
+
+func (o *mockSQLOpener) Open(driverName, dataSourceName string) (*sql.DB, error) {
+	return o.mockDB, nil
+}
 
 func newTestPlugin(t *testing.T) (*pgPlugin, sqlmock.Sqlmock) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
@@ -21,20 +55,21 @@ func newTestPlugin(t *testing.T) (*pgPlugin, sqlmock.Sqlmock) {
 }
 
 func TestInitConnectionValid(t *testing.T) {
-	plugin := &pgPlugin{}
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp), sqlmock.MonitorPingsOption(true))
+	db, mock, err := sqlmock.New()
 	if err != nil {
-		t.Fatalf("failed to open sqlmock database: %s", err)
+		t.Fatalf("Failed to create mock: %v", err)
 	}
 	defer db.Close()
-	plugin.db = db
 
-	mock.ExpectPing().WillReturnError(nil)
-	if err := plugin.db.Ping(); err != nil {
-		t.Fatalf("Ping failed: %s", err)
+	mock.ExpectPing()
+
+	plugin := &pgPlugin{
+		opener: &mockSQLOpener{mockDB: db},
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestInitConnectionValid: %s", err)
+
+	err = plugin.InitConnection("postgres://user:pass@localhost:5432/db")
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
 	}
 }
 
@@ -147,28 +182,40 @@ func TestTableGetTimeWithTimezone(t *testing.T) {
 }
 
 func TestTableCreate(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	data := []map[string]interface{}{
-		{"id": 1, "name": "Alice"},
-		{"id": 2, "name": "Bob"},
-		{"id": 3, "name": "Charlie"},
-	}
-	expectedRegex := regexp.QuoteMeta("INSERT INTO users (id, name) VALUES ($1, $2), ($3, $4), ($5, $6)")
-	mock.ExpectBegin()
-	mock.ExpectExec(expectedRegex).
-		WithArgs(1, "Alice", 2, "Bob", 3, "Charlie").
-		WillReturnResult(sqlmock.NewResult(1, 3))
-	mock.ExpectCommit()
-	result, err := plugin.TableCreate("user1", "users", data, nil)
+	db, mock, err := sqlmock.New()
 	if err != nil {
-		t.Fatalf("TableCreate error: %s", err)
+		t.Fatalf("Failed to create mock: %v", err)
 	}
-	if len(result) != 3 {
-		t.Errorf("expected 3 rows inserted, got %d", len(result))
+	defer db.Close()
+
+	plugin := &pgPlugin{
+		db:            db,
+		bulkThreshold: 1000, // Set high threshold to avoid bulk operations in this test
 	}
+
+	data := []map[string]interface{}{
+		{"id": 1, "name": "Test1"},
+		{"id": 2, "name": "Test2"},
+		{"id": 3, "name": "Test3"},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO users \\(id, name\\) VALUES \\(\\$1, \\$2\\), \\(\\$3, \\$4\\), \\(\\$5, \\$6\\)").
+		WithArgs(1, "Test1", 2, "Test2", 3, "Test3").
+		WillReturnResult(sqlmock.NewResult(0, 3))
+	mock.ExpectCommit()
+
+	result, err := plugin.TableCreate("test_user", "users", data, nil)
+	if err != nil {
+		t.Errorf("TableCreate error: %v", err)
+	}
+
+	if len(result) != len(data) {
+		t.Errorf("Expected %d results, got %d", len(data), len(result))
+	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestTableCreate: %s", err)
+		t.Errorf("Unfulfilled expectations: %v", err)
 	}
 }
 
@@ -310,5 +357,476 @@ func TestGetSchema(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations in TestGetSchema: %v", err)
+	}
+}
+
+func TestInitConnectionWithParams(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectPing()
+
+	plugin := &pgPlugin{
+		opener: &mockSQLOpener{mockDB: db},
+	}
+
+	uri := "postgres://user:pass@localhost:5432/db?maxOpenConns=50&maxIdleConns=10&connMaxLifetime=15&connMaxIdleTime=20&timeout=60"
+	err = plugin.InitConnection(uri)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	if plugin.defaultTimeout != 60*time.Second {
+		t.Errorf("Expected timeout 60s, got %v", plugin.defaultTimeout)
+	}
+}
+
+func TestInitConnectionDefaults(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectPing()
+
+	plugin := &pgPlugin{
+		opener: &mockSQLOpener{mockDB: db},
+	}
+
+	uri := "postgres://user:pass@localhost:5432/db"
+	err = plugin.InitConnection(uri)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	if plugin.defaultTimeout != 30*time.Second {
+		t.Errorf("Expected default timeout 30s, got %v", plugin.defaultTimeout)
+	}
+}
+
+func TestInitConnectionInvalidURI(t *testing.T) {
+	plugin := &pgPlugin{
+		opener: &mockSQLOpener{},
+	}
+
+	err := plugin.InitConnection("invalid://uri")
+	if err == nil {
+		t.Error("Expected error for invalid URI")
+	}
+}
+
+func TestInitConnectionInvalidParams(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{
+			name: "Invalid maxOpenConns",
+			uri:  "postgres://user:pass@localhost:5432/db?maxOpenConns=invalid",
+		},
+		{
+			name: "Invalid maxIdleConns",
+			uri:  "postgres://user:pass@localhost:5432/db?maxIdleConns=invalid",
+		},
+		{
+			name: "Invalid connMaxLifetime",
+			uri:  "postgres://user:pass@localhost:5432/db?connMaxLifetime=invalid",
+		},
+		{
+			name: "Invalid connMaxIdleTime",
+			uri:  "postgres://user:pass@localhost:5432/db?connMaxIdleTime=invalid",
+		},
+		{
+			name: "Invalid timeout",
+			uri:  "postgres://user:pass@localhost:5432/db?timeout=invalid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := &pgPlugin{
+				opener: &mockSQLOpener{},
+			}
+
+			err := plugin.InitConnection(tt.uri)
+			if err == nil {
+				t.Error("Expected error for invalid parameter")
+			}
+		})
+	}
+}
+
+func TestInitConnectionWithBulkThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		uri           string
+		expectedValue int
+		expectError   bool
+	}{
+		{
+			name:          "Default bulk threshold",
+			uri:           "postgres://user:pass@localhost:5432/db",
+			expectedValue: 100,
+			expectError:   false,
+		},
+		{
+			name:          "Custom bulk threshold",
+			uri:           "postgres://user:pass@localhost:5432/db?bulkThreshold=500",
+			expectedValue: 500,
+			expectError:   false,
+		},
+		{
+			name:          "Invalid bulk threshold",
+			uri:           "postgres://user:pass@localhost:5432/db?bulkThreshold=invalid",
+			expectedValue: 0,
+			expectError:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("Failed to create mock: %v", err)
+			}
+			defer db.Close()
+
+			mock.ExpectPing()
+
+			plugin := &pgPlugin{
+				opener: &mockSQLOpener{mockDB: db},
+			}
+
+			err = plugin.InitConnection(tt.uri)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if plugin.bulkThreshold != tt.expectedValue {
+				t.Errorf("Expected bulk threshold %d, got %d", tt.expectedValue, plugin.bulkThreshold)
+			}
+		})
+	}
+}
+
+func TestTableCreateWithBulkOperations(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer db.Close()
+
+	plugin := &pgPlugin{
+		db:            db,
+		bulkThreshold: 2, // Set low threshold for testing
+	}
+
+	tests := []struct {
+		name        string
+		data        []map[string]interface{}
+		expectBulk  bool
+		expectError bool
+	}{
+		{
+			name: "Regular insert",
+			data: []map[string]interface{}{
+				{"id": 1, "name": "Test1"},
+			},
+			expectBulk:  false,
+			expectError: false,
+		},
+		{
+			name: "Bulk insert",
+			data: []map[string]interface{}{
+				{"id": 1, "name": "Test1"},
+				{"id": 2, "name": "Test2"},
+				{"id": 3, "name": "Test3"},
+			},
+			expectBulk:  true,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock.ExpectBegin()
+
+			if tt.expectBulk {
+				mock.ExpectExec("CREATE TEMP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectPrepare("COPY")
+				for range tt.data {
+					mock.ExpectExec("COPY").WillReturnResult(sqlmock.NewResult(0, 1))
+				}
+				mock.ExpectExec("INSERT INTO").WillReturnResult(sqlmock.NewResult(0, int64(len(tt.data))))
+			} else {
+				mock.ExpectExec("INSERT INTO").
+					WithArgs(tt.data[0]["id"], tt.data[0]["name"]).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			mock.ExpectCommit()
+
+			result, err := plugin.TableCreate("test_user", "test_table", tt.data, nil)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if len(result) != len(tt.data) {
+				t.Errorf("Expected %d results, got %d", len(tt.data), len(result))
+			}
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("Unfulfilled expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetSchemaComprehensive(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer db.Close()
+
+	plugin := &pgPlugin{
+		db: db,
+	}
+
+	// Mock context application
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT set_config").WithArgs("request.user", "test_user").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("SELECT set_config").WithArgs("erctx.user", "test_user").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Mock tables query
+	tableRows := sqlmock.NewRows([]string{"table_name"}).
+		AddRow("users").
+		AddRow("products")
+	mock.ExpectQuery("SELECT table_name FROM information_schema.tables").WillReturnRows(tableRows)
+
+	// Mock columns query for users table
+	userColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("id", "integer", "NO", nil).
+		AddRow("name", "character varying", "NO", nil).
+		AddRow("created_at", "timestamp", "YES", "CURRENT_TIMESTAMP")
+	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
+		WithArgs("users").
+		WillReturnRows(userColumns)
+
+	// Mock columns query for products table
+	productColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("id", "integer", "NO", nil).
+		AddRow("name", "character varying", "NO", nil).
+		AddRow("price", "numeric", "NO", nil)
+	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
+		WithArgs("products").
+		WillReturnRows(productColumns)
+
+	// Mock views query
+	viewRows := sqlmock.NewRows([]string{"table_name"}).
+		AddRow("user_stats")
+	mock.ExpectQuery("SELECT table_name FROM information_schema.tables.*VIEW").WillReturnRows(viewRows)
+
+	// Mock columns query for view
+	viewColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("user_id", "integer", "YES", nil).
+		AddRow("total_orders", "bigint", "YES", nil)
+	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
+		WithArgs("user_stats").
+		WillReturnRows(viewColumns)
+
+	// Mock functions query
+	functionRows := sqlmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).
+		AddRow("calculate_total", "calculate_total_123", "numeric")
+	mock.ExpectQuery("SELECT routine_name, specific_name, data_type FROM information_schema.routines").
+		WillReturnRows(functionRows)
+
+	// Mock function parameters query
+	paramRows := sqlmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).
+		AddRow("user_id", "integer", "IN", 1).
+		AddRow("start_date", "date", "IN", 2)
+	mock.ExpectQuery("SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters").
+		WithArgs("calculate_total_123").
+		WillReturnRows(paramRows)
+
+	mock.ExpectCommit()
+
+	ctx := map[string]interface{}{
+		"user": "test_user",
+	}
+
+	schema, err := plugin.GetSchema(ctx)
+	if err != nil {
+		t.Fatalf("GetSchema failed: %v", err)
+	}
+
+	schemaMap, ok := schema.(map[string]interface{})
+	if !ok {
+		t.Fatal("Schema is not a map")
+	}
+
+	// Verify tables
+	tables, ok := schemaMap["tables"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Tables schema is not a map")
+	}
+
+	// Check users table
+	usersSchema, ok := tables["users"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Users table schema is not a map")
+	}
+
+	usersProps, ok := usersSchema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Users properties is not a map")
+	}
+
+	if _, ok := usersProps["id"]; !ok {
+		t.Error("Users schema missing id field")
+	}
+
+	// Check views
+	views, ok := schemaMap["views"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Views schema is not a map")
+	}
+
+	if _, ok := views["user_stats"]; !ok {
+		t.Error("Views schema missing user_stats view")
+	}
+
+	// Check RPC
+	rpc, ok := schemaMap["rpc"].(map[string]interface{})
+	if !ok {
+		t.Fatal("RPC schema is not a map")
+	}
+
+	if _, ok := rpc["calculate_total"]; !ok {
+		t.Error("RPC schema missing calculate_total function")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %v", err)
+	}
+}
+
+func TestTableDeleteComprehensive(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer db.Close()
+
+	plugin := &pgPlugin{
+		db: db,
+	}
+
+	tests := []struct {
+		name        string
+		table       string
+		where       map[string]interface{}
+		ctx         map[string]interface{}
+		affected    int64
+		expectError bool
+	}{
+		{
+			name:        "Simple delete",
+			table:       "users",
+			where:       map[string]interface{}{"id": 1},
+			ctx:         nil,
+			affected:    1,
+			expectError: false,
+		},
+		{
+			name:        "Delete with context",
+			table:       "orders",
+			where:       map[string]interface{}{"status": "pending"},
+			ctx:         map[string]interface{}{"user_id": 123},
+			affected:    2,
+			expectError: false,
+		},
+		{
+			name:        "Delete all",
+			table:       "temp_data",
+			where:       map[string]interface{}{},
+			ctx:         nil,
+			affected:    5,
+			expectError: false,
+		},
+		{
+			name:        "Delete with multiple conditions",
+			table:       "products",
+			where:       map[string]interface{}{"category": "electronics", "price": 100},
+			ctx:         nil,
+			affected:    3,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock.ExpectBegin()
+
+			if tt.ctx != nil {
+				for k, v := range tt.ctx {
+					mock.ExpectExec("SELECT set_config").
+						WithArgs("request."+k, fmt.Sprintf("%v", v)).
+						WillReturnResult(sqlmock.NewResult(0, 1))
+					mock.ExpectExec("SELECT set_config").
+						WithArgs("erctx."+k, fmt.Sprintf("%v", v)).
+						WillReturnResult(sqlmock.NewResult(0, 1))
+				}
+			}
+
+			whereClause := "DELETE FROM " + tt.table
+			if len(tt.where) > 0 {
+				whereClause += " WHERE"
+			}
+
+			mock.ExpectExec(whereClause).WillReturnResult(sqlmock.NewResult(0, tt.affected))
+			mock.ExpectCommit()
+
+			affected, err := plugin.TableDelete("test_user", tt.table, tt.where, tt.ctx)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if int64(affected) != tt.affected {
+				t.Errorf("Expected %d affected rows, got %d", tt.affected, affected)
+			}
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("Unfulfilled expectations: %v", err)
+			}
+		})
 	}
 }

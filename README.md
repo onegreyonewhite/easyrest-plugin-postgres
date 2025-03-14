@@ -13,6 +13,41 @@ The **EasyREST PostgreSQL Plugin** is an external plugin for [EasyREST](https://
 
 ---
 
+## Performance Optimizations
+
+The plugin includes several performance optimizations:
+
+1. **Connection Pool Management:**
+   - Configurable maximum open connections (default: 100)
+   - Configurable idle connections (default: 25)
+   - Connection lifetime management
+   - Idle connection timeout
+
+2. **Bulk Operations:**
+   - Automatic COPY for large inserts (>100 rows)
+   - Batch processing for large result sets
+   - Memory-efficient result handling
+
+3. **Transaction Optimizations:**
+   - Read-only transactions for SELECT queries
+   - Configurable transaction timeouts
+   - Proper connection release
+
+4. **Query Parameters:**
+   - `maxOpenConns` - Maximum number of open connections (default: 100)
+   - `maxIdleConns` - Maximum number of idle connections (default: 25)
+   - `connMaxLifetime` - Connection reuse time in minutes (default: 5)
+   - `connMaxIdleTime` - Connection idle time in minutes (default: 10)
+   - `timeout` - Query timeout in seconds (default: 30)
+   - `bulkThreshold` - Number of rows threshold for using COPY command (default: 100)
+
+Example URI with all optimization parameters:
+```bash
+export ER_DB_PG="postgres://postgres:root@localhost:5433/easyrestdb?maxOpenConns=100&maxIdleConns=25&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&sslmode=disable&search_path=public"
+```
+
+---
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
@@ -48,7 +83,7 @@ docker run --name pg-easyrest -p 5433:5432 \
 This command starts a PostgreSQL container:
 
 - **Container Name:** `pg-easyrest`
-- **Host Port:** `5433` (mapped to PostgreSQL’s default port 5432 in the container)
+- **Host Port:** `5433` (mapped to PostgreSQL's default port 5432 in the container)
 - **Password:** `root`
 - **Database Created:** `easyrestdb`
 
@@ -97,6 +132,19 @@ export ER_DEFAULT_TIMEZONE="GMT"
 ```
 
 - **ER_DB_PG:** The URI for the PostgreSQL database. The plugin is selected when the URI scheme is `pg://`.
+  
+  Additional connection parameters can be specified in the URI:
+  - `maxOpenConns` - Maximum number of open connections to the database (default: 100)
+  - `maxIdleConns` - Maximum number of idle connections in the pool (default: 25)
+  - `connMaxLifetime` - Maximum amount of time a connection may be reused in minutes (default: 5)
+  - `connMaxIdleTime` - Maximum amount of time a connection may be idle in minutes (default: 10)
+  - Any standard PostgreSQL connection parameters (e.g., `sslmode`, `search_path`, etc.)
+
+  Example with all parameters:
+  ```bash
+  export ER_DB_PG="postgres://postgres:root@localhost:5433/easyrestdb?maxOpenConns=100&maxIdleConns=25&connMaxLifetime=5&connMaxIdleTime=10&bulkThreshold=100&sslmode=disable&search_path=public"
+  ```
+
 - **ER_TOKEN_SECRET & ER_TOKEN_USER_SEARCH:** Used by EasyREST for JWT authentication.
 - **ER_DEFAULT_TIMEZONE:** Default timezone for context propagation.
 
