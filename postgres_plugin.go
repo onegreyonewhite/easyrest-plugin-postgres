@@ -18,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.2.1"
+var Version = "v0.2.2"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
@@ -155,7 +155,7 @@ func (p *pgPlugin) InitConnection(uri string) error {
 // For each key, it sets two variables: one with prefix "request." (complex types are marshaled to JSON)
 // and one with prefix "erctx." using the default string representation.
 // Keys are processed in sorted order.
-func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
+func ApplyPluginContext(tx *sql.Tx, ctx map[string]any) error {
 	// Collect and sort keys.
 	keys := make([]string, 0, len(ctx))
 	for k := range ctx {
@@ -166,7 +166,7 @@ func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
 		val := ctx[key]
 		var requestVal string
 		switch val.(type) {
-		case map[string]interface{}, []interface{}:
+		case map[string]any, []any:
 			b, err := json.Marshal(val)
 			if err != nil {
 				return err
@@ -188,7 +188,7 @@ func ApplyPluginContext(tx *sql.Tx, ctx map[string]interface{}) error {
 }
 
 // processRows processes query results in batches
-func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string]interface{}, error) {
+func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -196,25 +196,25 @@ func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string
 	numCols := len(cols)
 
 	// Pre-allocate memory for results
-	results := make([]map[string]interface{}, 0, 1000)
+	results := make([]map[string]any, 0, 1000)
 
 	// Reuse slices for scanning
-	columns := make([]interface{}, numCols)
-	columnPointers := make([]interface{}, numCols)
+	columns := make([]any, numCols)
+	columnPointers := make([]any, numCols)
 	for i := range columns {
 		columnPointers[i] = &columns[i]
 	}
 
 	// Process results in batches
 	const batchSize = 1000
-	batch := make([]map[string]interface{}, 0, batchSize)
+	batch := make([]map[string]any, 0, batchSize)
 
 	for rows.Next() {
 		if err := rows.Scan(columnPointers...); err != nil {
 			return nil, err
 		}
 
-		rowMap := make(map[string]interface{}, numCols)
+		rowMap := make(map[string]any, numCols)
 		for i, colName := range cols {
 			if t, ok := columns[i].(time.Time); ok {
 				adjusted := t.In(loc)
@@ -244,8 +244,8 @@ func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string
 }
 
 // TableGet executes a SELECT query with optional WHERE, GROUP BY, ORDER BY, LIMIT and OFFSET.
-func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where map[string]interface{},
-	ordering []string, groupBy []string, limit, offset int, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where map[string]any,
+	ordering []string, groupBy []string, limit, offset int, ctx map[string]any) ([]map[string]any, error) {
 
 	queryCtx, cancel := p.newContextWithTimeout()
 	defer cancel()
@@ -316,9 +316,9 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 }
 
 // TableCreate performs an INSERT operation on the specified table
-func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
 	if len(data) == 0 {
-		return []map[string]interface{}{}, nil
+		return []map[string]any{}, nil
 	}
 
 	// Use COPY for large datasets
@@ -345,7 +345,7 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 	colsStr := strings.Join(keys, ", ")
 
 	var valuePlaceholders []string
-	var args []interface{}
+	var args []any
 	for _, row := range data {
 		var ph []string
 		for _, k := range keys {
@@ -367,7 +367,7 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]interface
 }
 
 // bulkCreate uses COPY for efficient insertion of large amounts of data
-func (p *pgPlugin) bulkCreate(table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+func (p *pgPlugin) bulkCreate(table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
@@ -404,7 +404,7 @@ func (p *pgPlugin) bulkCreate(table string, data []map[string]interface{}, ctx m
 
 	// Copy data
 	for _, row := range data {
-		values := make([]interface{}, len(keys))
+		values := make([]any, len(keys))
 		for i, key := range keys {
 			values[i] = row[key]
 		}
@@ -429,7 +429,7 @@ func (p *pgPlugin) bulkCreate(table string, data []map[string]interface{}, ctx m
 }
 
 // TableUpdate executes an UPDATE query on the specified table.
-func (p *pgPlugin) TableUpdate(userID, table string, data map[string]interface{}, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
+func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where map[string]any, ctx map[string]any) (int, error) {
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return 0, err
@@ -441,7 +441,7 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]interface{}
 		}
 	}
 	var setParts []string
-	var args []interface{}
+	var args []any
 	for k, v := range data {
 		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
 		args = append(args, v)
@@ -472,7 +472,7 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]interface{}
 }
 
 // TableDelete executes a DELETE query on the specified table.
-func (p *pgPlugin) TableDelete(userID, table string, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
+func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return 0, err
@@ -508,14 +508,14 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]interface{
 
 // CallFunction executes a function call using SELECT syntax.
 // Parameters are passed in sorted order by key.
-func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interface{}, ctx map[string]interface{}) (interface{}, error) {
+func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ctx map[string]any) (any, error) {
 	keys := make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	var placeholders []string
-	var args []interface{}
+	var args []any
 	for _, k := range keys {
 		placeholders = append(placeholders, "?")
 		args = append(args, data[k])
@@ -543,10 +543,10 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]interfa
 		tx.Rollback()
 		return nil, err
 	}
-	var result interface{}
+	var result any
 	if rows.Next() {
-		columns := make([]interface{}, len(cols))
-		columnPointers := make([]interface{}, len(cols))
+		columns := make([]any, len(cols))
+		columnPointers := make([]any, len(cols))
 		for i := range columns {
 			columnPointers[i] = &columns[i]
 		}
@@ -582,8 +582,8 @@ func convertPlaceholders(query string) string {
 }
 
 // getTablesSchema builds a schema for each base table from information_schema.
-func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
-	result := make(map[string]interface{})
+func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]any, error) {
+	result := make(map[string]any)
 	tableQuery := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
 	rows, err := tx.QueryContext(context.Background(), tableQuery)
 	if err != nil {
@@ -605,7 +605,7 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		properties := make(map[string]interface{})
+		properties := make(map[string]any)
 		var required []string
 		for colRows.Next() {
 			var colName, dataType, isNullable string
@@ -615,7 +615,7 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 				return nil, err
 			}
 			swType := mapPostgresType(dataType)
-			prop := map[string]interface{}{
+			prop := map[string]any{
 				"type": swType,
 			}
 			if isNullable == "YES" {
@@ -627,7 +627,7 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 			properties[colName] = prop
 		}
 		colRows.Close()
-		schema := map[string]interface{}{
+		schema := map[string]any{
 			"type":       "object",
 			"properties": properties,
 		}
@@ -640,8 +640,8 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]interface{}, error) {
 }
 
 // getViewsSchema builds a schema for each view from information_schema.
-func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
-	result := make(map[string]interface{})
+func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]any, error) {
+	result := make(map[string]any)
 	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'"
 	rows, err := tx.QueryContext(context.Background(), query)
 	if err != nil {
@@ -663,7 +663,7 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		properties := make(map[string]interface{})
+		properties := make(map[string]any)
 		var required []string
 		for colRows.Next() {
 			var colName, dataType, isNullable string
@@ -673,7 +673,7 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
 				return nil, err
 			}
 			swType := mapPostgresType(dataType)
-			prop := map[string]interface{}{
+			prop := map[string]any{
 				"type": swType,
 			}
 			if isNullable == "YES" {
@@ -685,7 +685,7 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
 			properties[colName] = prop
 		}
 		colRows.Close()
-		schema := map[string]interface{}{
+		schema := map[string]any{
 			"type":       "object",
 			"properties": properties,
 		}
@@ -698,8 +698,8 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]interface{}, error) {
 }
 
 // getRPCSchema builds schemas for stored functions.
-func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]interface{}, error) {
-	result := make(map[string]interface{})
+func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]any, error) {
+	result := make(map[string]any)
 	rpcQuery := "SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'"
 	rows, err := tx.QueryContext(context.Background(), rpcQuery)
 	if err != nil {
@@ -729,7 +729,7 @@ func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		properties := make(map[string]interface{})
+		properties := make(map[string]any)
 		var reqFields []string
 		for paramRows.Next() {
 			var paramName sql.NullString
@@ -743,32 +743,32 @@ func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]interface{}, error) {
 				continue
 			}
 			swType := mapPostgresType(dataType)
-			prop := map[string]interface{}{
+			prop := map[string]any{
 				"type": swType,
 			}
 			properties[paramName.String] = prop
 			reqFields = append(reqFields, paramName.String)
 		}
 		paramRows.Close()
-		inSchema := map[string]interface{}{
+		inSchema := map[string]any{
 			"type":       "object",
 			"properties": properties,
 		}
 		if len(reqFields) > 0 {
 			inSchema["required"] = reqFields
 		}
-		outSchema := map[string]interface{}{
+		outSchema := map[string]any{
 			"type":       "object",
-			"properties": map[string]interface{}{},
+			"properties": map[string]any{},
 		}
 		if strings.ToLower(r.returnType) != "void" {
-			outSchema["properties"] = map[string]interface{}{
-				"result": map[string]interface{}{
+			outSchema["properties"] = map[string]any{
+				"result": map[string]any{
 					"type": mapPostgresType(r.returnType),
 				},
 			}
 		}
-		result[r.routineName] = []interface{}{inSchema, outSchema}
+		result[r.routineName] = []any{inSchema, outSchema}
 	}
 	return result, nil
 }
@@ -799,7 +799,7 @@ func mapPostgresType(dt string) string {
 
 // GetSchema returns a schema object with "tables", "views" and "rpc" keys.
 // It applies the provided context to the session before retrieving the schema.
-func (p *pgPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
+func (p *pgPlugin) GetSchema(ctx map[string]any) (any, error) {
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
@@ -828,7 +828,7 @@ func (p *pgPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]interface{}{
+	return map[string]any{
 		"tables": tables,
 		"views":  views,
 		"rpc":    rpc,

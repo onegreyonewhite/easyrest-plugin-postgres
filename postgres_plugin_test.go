@@ -86,8 +86,8 @@ func TestTableGet(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 	selectFields := []string{"id", "name"}
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "active"},
+	where := map[string]any{
+		"status": map[string]any{"=": "active"},
 	}
 	mock.ExpectBegin()
 	queryRegex := regexp.QuoteMeta(`SELECT id, name FROM users WHERE status = $1`)
@@ -112,11 +112,11 @@ func TestTableGet(t *testing.T) {
 func TestTableGetSelectFieldSubstitution(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
-	ctx := map[string]interface{}{
+	ctx := map[string]any{
 		"claims_sub": "sub_value",
 	}
 	selectFields := []string{"id", "erctx.claims_sub"}
-	where := map[string]interface{}{}
+	where := map[string]any{}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
 		WithArgs("request.claims_sub", "sub_value").
@@ -150,7 +150,7 @@ func TestTableGetTimeWithTimezone(t *testing.T) {
 	// In America/New_York (UTC-5), expected time becomes 10:30.
 	expectedTime := "2025-03-07 10:30:00"
 	selectFields := []string{"id", "created_at"}
-	where := map[string]interface{}{"dummy": "val"}
+	where := map[string]any{"dummy": "val"}
 	expQ := "SELECT id, created_at FROM dummy WHERE dummy = $1"
 	rows := sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, utcTime)
 	mock.ExpectBegin()
@@ -163,7 +163,7 @@ func TestTableGetTimeWithTimezone(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(expQ)).WithArgs("val").WillReturnRows(rows)
 	mock.ExpectCommit()
-	ctxData := map[string]interface{}{
+	ctxData := map[string]any{
 		"timezone": "America/New_York",
 	}
 	results, err := plugin.TableGet("u", "dummy", selectFields, where, nil, nil, 0, 0, ctxData)
@@ -193,7 +193,7 @@ func TestTableCreate(t *testing.T) {
 		bulkThreshold: 1000, // Set high threshold to avoid bulk operations in this test
 	}
 
-	data := []map[string]interface{}{
+	data := []map[string]any{
 		{"id": 1, "name": "Test1"},
 		{"id": 2, "name": "Test2"},
 		{"id": 3, "name": "Test3"},
@@ -222,11 +222,11 @@ func TestTableCreate(t *testing.T) {
 func TestTableUpdate(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
-	data := map[string]interface{}{
+	data := map[string]any{
 		"name": "Bob",
 	}
-	where := map[string]interface{}{
-		"id": map[string]interface{}{"=": 1},
+	where := map[string]any{
+		"id": map[string]any{"=": 1},
 	}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET name = $1 WHERE id = $2`)).
@@ -248,8 +248,8 @@ func TestTableUpdate(t *testing.T) {
 func TestTableDelete(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "inactive"},
+	where := map[string]any{
+		"status": map[string]any{"=": "inactive"},
 	}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM users WHERE status = $1`)).
@@ -271,7 +271,7 @@ func TestTableDelete(t *testing.T) {
 func TestCallFunction(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
-	data := map[string]interface{}{
+	data := map[string]any{
 		"param": "value",
 	}
 	mock.ExpectBegin()
@@ -284,7 +284,7 @@ func TestCallFunction(t *testing.T) {
 		t.Fatalf("CallFunction error: %s", err)
 	}
 	out, _ := json.Marshal(result)
-	var res interface{}
+	var res any
 	if err := json.Unmarshal(out, &res); err != nil {
 		t.Fatalf("failed to unmarshal result: %s", err)
 	}
@@ -299,7 +299,7 @@ func TestCallFunction(t *testing.T) {
 func TestGetSchema(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
-	ctxData := map[string]interface{}{
+	ctxData := map[string]any{
 		"timezone": "UTC",
 	}
 	mock.ExpectBegin()
@@ -535,13 +535,13 @@ func TestTableCreateWithBulkOperations(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		data        []map[string]interface{}
+		data        []map[string]any
 		expectBulk  bool
 		expectError bool
 	}{
 		{
 			name: "Regular insert",
-			data: []map[string]interface{}{
+			data: []map[string]any{
 				{"id": 1, "name": "Test1"},
 			},
 			expectBulk:  false,
@@ -549,7 +549,7 @@ func TestTableCreateWithBulkOperations(t *testing.T) {
 		},
 		{
 			name: "Bulk insert",
-			data: []map[string]interface{}{
+			data: []map[string]any{
 				{"id": 1, "name": "Test1"},
 				{"id": 2, "name": "Test2"},
 				{"id": 3, "name": "Test3"},
@@ -671,7 +671,7 @@ func TestGetSchemaComprehensive(t *testing.T) {
 
 	mock.ExpectCommit()
 
-	ctx := map[string]interface{}{
+	ctx := map[string]any{
 		"user": "test_user",
 	}
 
@@ -680,24 +680,24 @@ func TestGetSchemaComprehensive(t *testing.T) {
 		t.Fatalf("GetSchema failed: %v", err)
 	}
 
-	schemaMap, ok := schema.(map[string]interface{})
+	schemaMap, ok := schema.(map[string]any)
 	if !ok {
 		t.Fatal("Schema is not a map")
 	}
 
 	// Verify tables
-	tables, ok := schemaMap["tables"].(map[string]interface{})
+	tables, ok := schemaMap["tables"].(map[string]any)
 	if !ok {
 		t.Fatal("Tables schema is not a map")
 	}
 
 	// Check users table
-	usersSchema, ok := tables["users"].(map[string]interface{})
+	usersSchema, ok := tables["users"].(map[string]any)
 	if !ok {
 		t.Fatal("Users table schema is not a map")
 	}
 
-	usersProps, ok := usersSchema["properties"].(map[string]interface{})
+	usersProps, ok := usersSchema["properties"].(map[string]any)
 	if !ok {
 		t.Fatal("Users properties is not a map")
 	}
@@ -707,7 +707,7 @@ func TestGetSchemaComprehensive(t *testing.T) {
 	}
 
 	// Check views
-	views, ok := schemaMap["views"].(map[string]interface{})
+	views, ok := schemaMap["views"].(map[string]any)
 	if !ok {
 		t.Fatal("Views schema is not a map")
 	}
@@ -717,7 +717,7 @@ func TestGetSchemaComprehensive(t *testing.T) {
 	}
 
 	// Check RPC
-	rpc, ok := schemaMap["rpc"].(map[string]interface{})
+	rpc, ok := schemaMap["rpc"].(map[string]any)
 	if !ok {
 		t.Fatal("RPC schema is not a map")
 	}
@@ -745,15 +745,15 @@ func TestTableDeleteComprehensive(t *testing.T) {
 	tests := []struct {
 		name        string
 		table       string
-		where       map[string]interface{}
-		ctx         map[string]interface{}
+		where       map[string]any
+		ctx         map[string]any
 		affected    int64
 		expectError bool
 	}{
 		{
 			name:        "Simple delete",
 			table:       "users",
-			where:       map[string]interface{}{"id": 1},
+			where:       map[string]any{"id": 1},
 			ctx:         nil,
 			affected:    1,
 			expectError: false,
@@ -761,15 +761,15 @@ func TestTableDeleteComprehensive(t *testing.T) {
 		{
 			name:        "Delete with context",
 			table:       "orders",
-			where:       map[string]interface{}{"status": "pending"},
-			ctx:         map[string]interface{}{"user_id": 123},
+			where:       map[string]any{"status": "pending"},
+			ctx:         map[string]any{"user_id": 123},
 			affected:    2,
 			expectError: false,
 		},
 		{
 			name:        "Delete all",
 			table:       "temp_data",
-			where:       map[string]interface{}{},
+			where:       map[string]any{},
 			ctx:         nil,
 			affected:    5,
 			expectError: false,
@@ -777,7 +777,7 @@ func TestTableDeleteComprehensive(t *testing.T) {
 		{
 			name:        "Delete with multiple conditions",
 			table:       "products",
-			where:       map[string]interface{}{"category": "electronics", "price": 100},
+			where:       map[string]any{"category": "electronics", "price": 100},
 			ctx:         nil,
 			affected:    3,
 			expectError: false,

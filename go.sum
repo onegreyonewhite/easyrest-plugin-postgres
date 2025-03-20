@@ -39,8 +39,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/oklog/run v1.1.0 h1:GEenZ1cK0+q0+wsJew9qUg/DyD8k3JzYsZAi5gYi2mA=
 github.com/oklog/run v1.1.0/go.mod h1:sVPdnTZT1zYwAJeCMu2Th4T21pA3FPOQRfWjQlk7DVU=
-github.com/onegreyonewhite/easyrest v0.3.2 h1:sIPYuiL1MKF9Wknm0Bzw8zZWXD7iHPucIyChQq8UVWk=
-github.com/onegreyonewhite/easyrest v0.3.2/go.mod h1:MZif6LAgXKgSTWQBs6OmfP+pFqUKakuVDsTYhJd5MYw=
+github.com/onegreyonewhite/easyrest v0.4.0 h1:AgBzeO8CY8UE3JXnoN3Jt+ZAsEfPLYJfJ9bps4QMEJ4=
+github.com/onegreyonewhite/easyrest v0.4.0/go.mod h1:MATHGI91kUui/M9l73Jtu1CvvaMslrzsbWU1ul2OnKU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
