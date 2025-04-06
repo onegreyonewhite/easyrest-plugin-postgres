@@ -274,23 +274,32 @@ func TestCallFunction(t *testing.T) {
 	data := map[string]any{
 		"param": "value",
 	}
+	funcName := "doSomething"
+	expectedResult := "Processed: value"
+
 	mock.ExpectBegin()
-	queryRegex := regexp.QuoteMeta(`SELECT doSomething($1) AS result`)
-	rows := sqlmock.NewRows([]string{"result"}).AddRow("success")
+	// Updated query expectation to match the new format SELECT * FROM funcName(...)
+	queryRegex := regexp.QuoteMeta(fmt.Sprintf(`SELECT * FROM %s($1)`, funcName))
+	// Mock the result based on what processRows expects
+	rows := sqlmock.NewRows([]string{"doSomething"}).AddRow(expectedResult)
 	mock.ExpectQuery(queryRegex).WithArgs("value").WillReturnRows(rows)
 	mock.ExpectCommit()
-	result, err := plugin.CallFunction("user1", "doSomething", data, nil)
+
+	result, err := plugin.CallFunction("user1", funcName, data, nil)
 	if err != nil {
 		t.Fatalf("CallFunction error: %s", err)
 	}
-	out, _ := json.Marshal(result)
-	var res any
-	if err := json.Unmarshal(out, &res); err != nil {
-		t.Fatalf("failed to unmarshal result: %s", err)
+
+	// The modified CallFunction now returns the scalar value directly
+	resultStr, ok := result.(string)
+	if !ok {
+		t.Fatalf("Expected result to be a string, got %T", result)
 	}
-	if res != "success" {
-		t.Errorf("expected 'success', got %v", res)
+
+	if resultStr != expectedResult {
+		t.Errorf("expected '%s', got '%v'", expectedResult, resultStr)
 	}
+
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations in TestCallFunction: %s", err)
 	}

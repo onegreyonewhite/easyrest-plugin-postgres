@@ -61,20 +61,14 @@ CREATE TRIGGER before_product_update
     EXECUTE FUNCTION validate_product_update();
 
 -- Create a function that returns products for current user
+DROP FUNCTION IF EXISTS get_my_products();
 CREATE OR REPLACE FUNCTION get_my_products()
-RETURNS TEXT AS $$
-DECLARE
-    result TEXT;
+RETURNS SETOF products AS $$
 BEGIN
-    SELECT json_agg(row_to_json(p))
-    INTO result
-    FROM (
-        SELECT id, sku, name, price, stock_count, is_active, created_at
-        FROM products
-        WHERE created_by = (current_setting('request.claims', TRUE)::json->>'sub')
-    ) p;
-    
-    RETURN COALESCE(result, '[]');
+    RETURN QUERY
+    SELECT *
+    FROM products
+    WHERE created_by = (current_setting('request.claims', TRUE)::json->>'sub');
 END;
 $$ LANGUAGE plpgsql;
 

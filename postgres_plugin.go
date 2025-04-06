@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net/url"
 	"sort"
 	"strings"
@@ -18,7 +19,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.2.4"
+var Version = "v0.2.5"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
@@ -508,7 +509,11 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 
 // CallFunction executes a function call using SELECT syntax.
 // Parameters are passed in sorted order by key.
+// It handles scalar, SETOF, JSON, and void return types.
 func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ctx map[string]any) (any, error) {
+	queryCtx, cancel := p.newContextWithTimeout()
+	defer cancel()
+
 	keys := make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
@@ -520,50 +525,114 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 		placeholders = append(placeholders, "?")
 		args = append(args, data[k])
 	}
-	query := fmt.Sprintf("SELECT %s(%s) AS result", funcName, strings.Join(placeholders, ", "))
+
+	// Use function name directly, assuming it's safe or properly quoted if needed.
+	// The SELECT syntax automatically handles potential multiple return values (SETOF).
+	query := fmt.Sprintf("SELECT * FROM %s(%s)", funcName, strings.Join(placeholders, ", "))
 	query = convertPlaceholders(query)
-	tx, err := p.db.BeginTx(context.Background(), nil)
+
+	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
+		// Although function calls might modify data,
+		// we often use ReadCommitted for functions primarily reading data
+		// or when the function itself manages transactionality.
+		// Consider making this configurable if needed.
+		ReadOnly:  false, // Functions can modify data
+		Isolation: sql.LevelReadCommitted,
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer tx.Rollback() // Rollback if commit fails or not reached
+
+	loc := time.UTC
 	if ctx != nil {
 		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
-			return nil, err
+			return nil, fmt.Errorf("failed to apply plugin context: %w", err)
+		}
+		if tz, ok := ctx["timezone"].(string); ok && tz != "" {
+			if l, err := time.LoadLocation(tz); err == nil {
+				loc = l
+			} else {
+				log.Printf("Warning: Could not load timezone '%s': %v", tz, err)
+			}
 		}
 	}
-	rows, err := tx.QueryContext(context.Background(), query, args...)
+
+	rows, err := tx.QueryContext(queryCtx, query, args...)
 	if err != nil {
-		tx.Rollback()
-		return nil, err
+		// Check for specific PostgreSQL error indicating function doesn't return SETOF
+		// This might require checking the pgerr code. For now, general error handling.
+		// If the error suggests it's not a set-returning function, we could retry with SELECT funcName(...)
+		return nil, fmt.Errorf("failed to execute function query: %w", err)
 	}
-	cols, err := rows.Columns()
+	defer rows.Close() // Ensure rows are closed
+
+	// Use processRows to handle potential SETOF results or single composite results
+	results, err := p.processRows(rows, loc)
 	if err != nil {
-		rows.Close()
-		tx.Rollback()
-		return nil, err
+		return nil, fmt.Errorf("failed to process function results: %w", err)
 	}
-	var result any
-	if rows.Next() {
-		columns := make([]any, len(cols))
-		columnPointers := make([]any, len(cols))
-		for i := range columns {
-			columnPointers[i] = &columns[i]
-		}
-		if err := rows.Scan(columnPointers...); err != nil {
-			rows.Close()
-			tx.Rollback()
-			return nil, err
-		}
-		if len(columns) > 0 {
-			result = columns[0]
-		}
+
+	// Check if rows.Err() occurred during iteration in processRows
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during rows iteration: %w", err)
 	}
-	rows.Close() // Synchronously close rows
+
+	// Commit the transaction before returning results
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
-	return result, nil
+
+	// Analyze the results
+	if len(results) == 0 {
+		// Function returned void or an empty set
+		return nil, nil
+	}
+
+	if len(results) == 1 {
+		rowMap := results[0]
+		if len(rowMap) == 1 {
+			// Single row, single column: Potential scalar or JSON
+			var value any
+			// Get the single value from the map
+			for _, v := range rowMap {
+				value = v
+				break
+			}
+
+			switch v := value.(type) {
+			case []byte:
+				// Attempt to unmarshal if it looks like JSON
+				var parsedResult any
+				if json.Unmarshal(v, &parsedResult) == nil {
+					log.Printf("Successfully unmarshaled []byte result from function %s", funcName)
+					return parsedResult, nil
+				}
+				log.Printf("Result from function %s is []byte but not valid JSON, returning raw bytes", funcName)
+				return v, nil // Return raw bytes if not JSON
+			case string:
+				// Attempt to unmarshal if it looks like JSON
+				var parsedResult any
+				if json.Unmarshal([]byte(v), &parsedResult) == nil {
+					log.Printf("Successfully unmarshaled string result from function %s", funcName)
+					return parsedResult, nil
+				}
+				log.Printf("Result from function %s is string but not valid JSON, returning raw string", funcName)
+				return v, nil // Return raw string if not JSON
+			default:
+				// Return other scalar types directly
+				log.Printf("Returning scalar result of type %T from function %s", v, funcName)
+				return v, nil
+			}
+		}
+		// Single row, multiple columns: Return as is (map within a slice)
+		log.Printf("Returning single composite row result from function %s", funcName)
+		return results, nil
+	}
+
+	// Multiple rows: Return the slice of maps directly (SETOF result)
+	log.Printf("Returning SETOF result (%d rows) from function %s", len(results), funcName)
+	return results, nil
 }
 
 // convertPlaceholders replaces each "?" in the query with PostgreSQL-style "$1", "$2", etc.
