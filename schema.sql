@@ -21,8 +21,16 @@ CREATE TABLE IF NOT EXISTS products (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+
+DROP TRIGGER IF EXISTS update_products_updated_at ON products;
+DROP FUNCTION IF EXISTS update_updated_at_column();
+DROP TRIGGER IF EXISTS before_product_update ON products;
+DROP FUNCTION IF EXISTS validate_product_update();
+DROP FUNCTION IF EXISTS get_my_products();
+DROP FUNCTION IF EXISTS do_something(TEXT);
+
 -- Create a trigger function to update updated_at timestamp
-CREATE OR REPLACE FUNCTION update_updated_at_column()
+CREATE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
@@ -46,9 +54,7 @@ BEGIN
     IF OLD.created_by != (current_setting('request.claims', TRUE)::json->>'sub')
        AND (current_setting('request.claims', TRUE)::json->>'role') != 'admin' THEN
         -- If trying to update restricted fields
-        IF NEW.name != OLD.name OR NEW.description != OLD.description THEN
-            RAISE EXCEPTION 'Authorization failed: You can only modify products you created.';
-        END IF;
+        RAISE EXCEPTION 'Authorization failed: You can only modify products you created.';
     END IF;
     RETURN NEW;
 END;
@@ -61,8 +67,7 @@ CREATE TRIGGER before_product_update
     EXECUTE FUNCTION validate_product_update();
 
 -- Create a function that returns products for current user
-DROP FUNCTION IF EXISTS get_my_products();
-CREATE OR REPLACE FUNCTION get_my_products()
+CREATE FUNCTION get_my_products()
 RETURNS SETOF products AS $$
 BEGIN
     RETURN QUERY
@@ -73,7 +78,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Create a simple function for testing
-CREATE OR REPLACE FUNCTION do_something(json_param TEXT)
+CREATE FUNCTION do_something(json_param TEXT)
 RETURNS TEXT AS $$
 BEGIN
     RETURN 'Processed: ' || json_param;

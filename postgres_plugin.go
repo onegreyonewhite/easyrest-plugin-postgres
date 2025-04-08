@@ -19,7 +19,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.2.5"
+var Version = "v0.2.6"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
