@@ -4,6 +4,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -837,5 +838,141 @@ func TestTableDeleteComprehensive(t *testing.T) {
 				t.Errorf("Unfulfilled expectations: %v", err)
 			}
 		})
+	}
+}
+
+// newTestPluginWithCache creates a pgPlugin, pgCachePlugin, and sqlmock instance for testing.
+func newTestPluginWithCache(t *testing.T) (*pgPlugin, *pgCachePlugin, sqlmock.Sqlmock) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp)) // Use Regexp matcher
+	if err != nil {
+		t.Fatalf("failed to open sqlmock database: %s", err)
+	}
+	// Create the main plugin instance with the mock DB
+	plugin := &pgPlugin{db: db}
+	// Create the cache plugin instance, pointing to the main plugin
+	cachePlugin := &pgCachePlugin{dbPluginPointer: plugin}
+	return plugin, cachePlugin, mock
+}
+
+func TestPgCachePluginInitConnection(t *testing.T) {
+	// 1. Setup: Create plugin instances and the mock DB connection
+	plugin, cachePlugin, mock := newTestPluginWithCache(t)
+	// Ensure the mock DB is closed after the test
+	defer plugin.db.Close()
+
+	// 2. Expectation: Mock the SQL query that InitConnection should execute
+	// It expects "CREATE TABLE IF NOT EXISTS easyrest_cache ..."
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS easyrest_cache").
+		WillReturnResult(sqlmock.NewResult(0, 0)) // Expect success (no rows affected is fine for CREATE TABLE)
+
+	// 3. Action: Call the InitConnection method on the cache plugin instance
+	// Provide a dummy URI; in the test, the DB connection comes from the mock setup,
+	// but InitConnection might internally call the main plugin's InitConnection if db is nil.
+	err := cachePlugin.InitConnection("postgres://user:pass@localhost:5432/db")
+
+	// 4. Assertion: Check if there was an error during initialization
+	if err != nil {
+		t.Fatalf("cachePlugin.InitConnection failed: %v", err)
+	}
+
+	// 5. Verification: Ensure that the expected SQL query was actually executed
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations in TestPgCachePluginInitConnection: %s", err)
+	}
+	// Note: Testing the background cleanup goroutine directly is complex in unit tests.
+	// We assume it's started if InitConnection succeeds without error.
+}
+
+func TestPgCachePluginSetGet(t *testing.T) {
+	plugin, cachePlugin, mock := newTestPluginWithCache(t)
+	defer plugin.db.Close()
+
+	key := "testKey"
+	value := "testValue"
+	ttl := 5 * time.Minute
+	expiresAt := time.Now().Add(ttl) // Approximate expected time
+
+	// --- Test Set ---
+	// Mock the INSERT ... ON CONFLICT query called by the Set method
+	// Use sqlmock.AnyArg() for expiresAt, as the exact time might differ slightly
+	mock.ExpectExec("INSERT INTO easyrest_cache .* ON CONFLICT").
+		WithArgs(key, value, sqlmock.AnyArg()).   // Check key, value, and any timestamp
+		WillReturnResult(sqlmock.NewResult(1, 1)) // Expect successful insertion/update of 1 row
+
+	// Call the Set method
+	err := cachePlugin.Set(key, value, ttl)
+	if err != nil {
+		t.Fatalf("cachePlugin.Set failed: %v", err)
+	}
+
+	// --- Test Get (successful) ---
+	// Mock the SELECT query called by the Get method
+	rows := sqlmock.NewRows([]string{"value"}).AddRow(value) // Prepare result rows
+	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
+		WithArgs(key).       // Check that the query is executed with the correct key
+		WillReturnRows(rows) // Return the prepared rows
+
+	// Call the Get method
+	retrievedValue, err := cachePlugin.Get(key)
+	if err != nil {
+		t.Fatalf("cachePlugin.Get failed: %v", err)
+	}
+
+	// Check that the retrieved value matches the expected value
+	if retrievedValue != value {
+		t.Errorf("expected value '%s', got '%s'", value, retrievedValue)
+	}
+
+	// Check that all mock expectations were met
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations in TestPgCachePluginSetGet: %s", err)
+	}
+
+	// --- Test Get (key not found) ---
+	// Mock the SELECT query for a non-existent key
+	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
+		WithArgs("nonExistentKey").
+		WillReturnError(sql.ErrNoRows) // Expect sql.ErrNoRows error (standard for cache miss)
+
+	// Call Get for the non-existent key
+	_, err = cachePlugin.Get("nonExistentKey")
+	// Check that the specific sql.ErrNoRows error was returned
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows for non-existent key, got %v", err)
+	}
+
+	// Check mock expectations again
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations after non-existent key check: %s", err)
+	}
+
+	// Optional: More complex validation of the exact expiresAt time could be added,
+	// but it would require extracting the argument from sqlmock.AnyArg().
+	_ = expiresAt // Use expiresAt to avoid "unused variable" error
+}
+
+func TestPgCachePluginExpiration(t *testing.T) {
+	plugin, cachePlugin, mock := newTestPluginWithCache(t)
+	defer plugin.db.Close()
+
+	key := "expiredKey"
+
+	// --- Test Get (key expired) ---
+	// Mock the SELECT query for a key considered expired
+	// Mock returns sql.ErrNoRows because the 'expires_at > NOW()' condition would fail
+	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
+		WithArgs(key).
+		WillReturnError(sql.ErrNoRows)
+
+	// Call Get for the "expired" key
+	_, err := cachePlugin.Get(key)
+	// Check that sql.ErrNoRows error was returned
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows for expired key, got %v", err)
+	}
+
+	// Check that all mock expectations were met
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations in TestPgCachePluginExpiration: %s", err)
 	}
 }

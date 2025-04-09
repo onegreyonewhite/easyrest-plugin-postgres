@@ -45,6 +45,8 @@ github.com/onegreyonewhite/easyrest v0.5.0 h1:rE3WJLKndKZAXZzGbs+/YbTk/4hGt9PW+6
 github.com/onegreyonewhite/easyrest v0.5.0/go.mod h1:OGYb5Lb+UOoHQCrikFycqhQ5O5XXYgev0BmVM/tLD4U=
 github.com/onegreyonewhite/easyrest v0.5.1 h1:QQieKmaCrECBT59VEHfDft3btvO3+ie88ffsQd6W/PM=
 github.com/onegreyonewhite/easyrest v0.5.1/go.mod h1:fXizkLyblibBcF8Y2ZMj7MEkPLhxGJmNHRYCt14YPY8=
+github.com/onegreyonewhite/easyrest v0.6.0 h1:duZS5nhsGQOXckNhYZOjzQGrK7b9DT8Fg1tROWEI4FY=
+github.com/onegreyonewhite/easyrest v0.6.0/go.mod h1:CBk5BxmZE3GRC8BhttOB1wVGDBCIaqG12yCPsHABauQ=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
