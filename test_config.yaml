@@ -18,6 +18,6 @@ cors:
   max_age: 86400
 plugins:
   test:
-    uri: postgres://postgres:root@localhost:5433/easyrestdb?maxOpenConns=100&maxIdleConns=25&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&sslmode=disable&search_path=public
+    uri: postgres://postgres:root@localhost:5433/easyrestdb?maxOpenConns=100&maxIdleConns=25&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&sslmode=disable&search_path=public&autoCleanup=true
     path: ./easyrest-plugin-postgres
     enable_cache: true

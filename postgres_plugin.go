@@ -20,7 +20,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.3.0"
+var Version = "v0.3.2"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
@@ -126,6 +126,7 @@ func (p *pgPlugin) InitConnection(uri string) error {
 		}
 	}
 	queryParams.Del("bulkThreshold")
+	queryParams.Del("autoCleanup")
 
 	parsedURI.RawQuery = queryParams.Encode()
 	dsn := parsedURI.String()
@@ -916,6 +917,20 @@ type pgCachePlugin struct {
 // It relies on the underlying pgPlugin's InitConnection being called first or concurrently
 // by the plugin framework to establish the database connection.
 func (p *pgCachePlugin) InitConnection(uri string) error {
+	parsedURL, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("failed to parse URI: %w", err)
+	}
+
+	// Get the autoCleanup query parameter
+	autoCleanup := parsedURL.Query().Get("autoCleanup")
+
+	// Remove the autoCleanup parameter from the URI
+	query := parsedURL.Query()
+	query.Del("autoCleanup")
+	parsedURL.RawQuery = query.Encode()
+	uri = parsedURL.String()
+
 	// Ensure the underlying DB connection is initialized.
 	// This might be redundant if the framework guarantees calling InitConnection on the DB plugin first,
 	// but it ensures dbPluginPointer.db is available.
@@ -942,13 +957,15 @@ func (p *pgCachePlugin) InitConnection(uri string) error {
 		expires_at TIMESTAMPTZ
 	);`
 	// Use a background context as table creation is an initialization step.
-	_, err := p.dbPluginPointer.db.ExecContext(context.Background(), createTableSQL)
+	_, err = p.dbPluginPointer.db.ExecContext(context.Background(), createTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create cache table: %w", err)
 	}
 
 	// Launch background goroutine for cleanup
-	go p.cleanupExpiredCacheEntries()
+	if autoCleanup == "true" || autoCleanup == "1" {
+		go p.cleanupExpiredCacheEntries()
+	}
 
 	return nil
 }
