@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,12 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goccy/go-json"
 	hplugin "github.com/hashicorp/go-plugin"
 	_ "github.com/lib/pq"
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.3.2"
+var Version = "v0.3.3"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
@@ -154,6 +154,40 @@ func (p *pgPlugin) InitConnection(uri string) error {
 	}
 
 	return nil
+}
+
+// getTxPreference extracts the transaction preference ('commit' or 'rollback') from the context.
+// Defaults to 'commit' if not specified. Returns an error for invalid values.
+func getTxPreference(ctx map[string]any) (string, error) {
+	txPreference := "commit" // Default behavior
+	if ctx != nil {
+		// Use type assertion with checking for existence
+		if preferAny, preferExists := ctx["prefer"]; preferExists {
+			// Check if prefer is a map
+			if prefer, ok := preferAny.(map[string]any); ok {
+				// Check if tx exists within prefer
+				if txPrefAny, txPrefExists := prefer["tx"]; txPrefExists {
+					// Check if tx is a string
+					if txPref, ok := txPrefAny.(string); ok && txPref != "" { // Ensure it's a non-empty string
+						// Validate the value
+						if txPref == "commit" || txPref == "rollback" {
+							txPreference = txPref
+						} else {
+							return "", fmt.Errorf("invalid value for prefer.tx: '%s', must be 'commit' or 'rollback'", txPref)
+						}
+					} else if !ok {
+						// If prefer.tx exists but is not a string
+						return "", fmt.Errorf("invalid type for prefer.tx: expected string, got %T", txPrefAny)
+					}
+					// If txPref is an empty string, we keep the default "commit"
+				}
+			} else {
+				// If prefer exists but is not a map[string]any
+				return "", fmt.Errorf("invalid type for prefer: expected map[string]any, got %T", preferAny)
+			}
+		}
+	}
+	return txPreference, nil
 }
 
 // ApplyPluginContext sets session variables using set_config for all keys in ctx.
@@ -326,18 +360,32 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 		return []map[string]any{}, nil
 	}
 
+	// Get transaction preference
+	txPreference, err := getTxPreference(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use COPY for large datasets
 	if len(data) >= p.bulkThreshold {
-		return p.bulkCreate(table, data, ctx)
+		// Note: bulkCreate currently does not support the rollback preference.
+		// It creates a temp table, copies, inserts, and commits within its own transaction.
+		if txPreference == "rollback" {
+			return nil, fmt.Errorf("rollback preference is not currently supported for bulk create operations (rows >= %d)", p.bulkThreshold)
+		}
+		return p.bulkCreate(table, data, ctx) // bulkCreate handles its own commit
 	}
 
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
 	}
+	// Defer rollback in case of errors before the final commit/rollback decision
+	defer tx.Rollback() // This will be ignored if Commit() or Rollback() is called explicitly later
+
 	if ctx != nil {
 		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
+			// tx.Rollback() is handled by defer
 			return nil, err
 		}
 	}
@@ -362,26 +410,33 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, colsStr, strings.Join(valuePlaceholders, ", "))
 	query = convertPlaceholders(query)
 	if _, err := tx.ExecContext(context.Background(), query, args...); err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+
+	// Conditionally commit or rollback based on preference
+	if txPreference == "rollback" {
+		if err := tx.Rollback(); err != nil {
+			return nil, fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		// Return the data as if it were inserted, even though rolled back
+		return data, nil
+	} else {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return data, nil
 	}
-	return data, nil
 }
 
 // bulkCreate uses COPY for efficient insertion of large amounts of data
+// TODO: Refactor bulkCreate to accept a transaction and respect txPreference if needed.
 func (p *pgPlugin) bulkCreate(table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
+	// Note: This function currently manages its own transaction and always commits.
+	// The txPreference logic is handled in TableCreate before calling this.
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, err
-	}
-	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
-			return nil, err
-		}
 	}
 
 	// Get column list
@@ -435,13 +490,22 @@ func (p *pgPlugin) bulkCreate(table string, data []map[string]any, ctx map[strin
 
 // TableUpdate executes an UPDATE query on the specified table.
 func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where map[string]any, ctx map[string]any) (int, error) {
+	// Get transaction preference
+	txPreference, err := getTxPreference(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return 0, err
 	}
+	// Defer rollback in case of errors
+	defer tx.Rollback()
+
 	if ctx != nil {
 		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
+			// tx.Rollback() is handled by defer
 			return 0, err
 		}
 	}
@@ -462,29 +526,48 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 	query = convertPlaceholders(query)
 	res, err := tx.ExecContext(context.Background(), query, args...)
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+
+	// Conditionally commit or rollback
+	if txPreference == "rollback" {
+		if err := tx.Rollback(); err != nil {
+			return 0, fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		// Return affected rows count even if rolled back
+		return int(affected), nil
+	} else {
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return int(affected), nil
 	}
-	return int(affected), nil
 }
 
 // TableDelete executes a DELETE query on the specified table.
 func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
+	// Get transaction preference
+	txPreference, err := getTxPreference(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	tx, err := p.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return 0, err
 	}
+	// Defer rollback in case of errors
+	defer tx.Rollback()
+
 	if ctx != nil {
 		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
+			// tx.Rollback() is handled by defer
 			return 0, err
 		}
 	}
@@ -497,18 +580,28 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 	query = convertPlaceholders(query)
 	res, err := tx.ExecContext(context.Background(), query, args...)
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+
+	// Conditionally commit or rollback
+	if txPreference == "rollback" {
+		if err := tx.Rollback(); err != nil {
+			return 0, fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		// Return affected rows count even if rolled back
+		return int(affected), nil
+	} else {
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return int(affected), nil
 	}
-	return int(affected), nil
 }
 
 // CallFunction executes a function call using SELECT syntax.
@@ -517,6 +610,12 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ctx map[string]any) (any, error) {
 	queryCtx, cancel := p.newContextWithTimeout()
 	defer cancel()
+
+	// Get transaction preference
+	txPreference, err := getTxPreference(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	keys := make([]string, 0, len(data))
 	for k := range data {
@@ -582,9 +681,22 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 		return nil, fmt.Errorf("error during rows iteration: %w", err)
 	}
 
-	// Commit the transaction before returning results
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	// Conditionally commit or rollback based on preference
+	var finalErr error
+	if txPreference == "rollback" {
+		if err := tx.Rollback(); err != nil {
+			finalErr = fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		// No need to log here, behavior is intentional
+	} else {
+		if err := tx.Commit(); err != nil {
+			finalErr = fmt.Errorf("failed to commit transaction: %w", err)
+		}
+	}
+
+	// Return results even if rollback was requested, but prioritize transaction error
+	if finalErr != nil {
+		return nil, finalErr
 	}
 
 	// Analyze the results
