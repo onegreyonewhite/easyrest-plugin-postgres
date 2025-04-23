@@ -201,7 +201,7 @@ func TestTableCreate(t *testing.T) {
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO users \\(id, name\\) VALUES \\(\\$1, \\$2\\), \\(\\$3, \\$4\\), \\(\\$5, \\$6\\)").
+	mock.ExpectExec("INSERT INTO users \\(id, name\\) VALUES \\(\\$1,\\$2\\),\\(\\$3,\\$4\\),\\(\\$5,\\$6\\)").
 		WithArgs(1, "Test1", 2, "Test2", 3, "Test3").
 		WillReturnResult(sqlmock.NewResult(0, 3))
 	mock.ExpectCommit()

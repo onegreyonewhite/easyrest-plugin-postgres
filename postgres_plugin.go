@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.3.3"
+var Version = "v0.4.0"
 
 type sqlOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
@@ -49,8 +50,9 @@ type sqlDB interface {
 type pgPlugin struct {
 	db             sqlDB
 	opener         sqlOpener
-	defaultTimeout time.Duration // Default timeout for operations
-	bulkThreshold  int           // Threshold for bulk operations
+	defaultTimeout time.Duration             // Default timeout for operations
+	bulkThreshold  int                       // Threshold for bulk operations
+	timezoneCache  map[string]*time.Location // Cache for loaded timezones
 }
 
 // newContextWithTimeout creates a new context with timeout
@@ -152,6 +154,7 @@ func (p *pgPlugin) InitConnection(uri string) error {
 		}
 		p.db = db
 	}
+	p.timezoneCache = make(map[string]*time.Location)
 
 	return nil
 }
@@ -289,29 +292,43 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 	queryCtx, cancel := p.newContextWithTimeout()
 	defer cancel()
 
-	fields := "*"
+	var queryBuilder strings.Builder
+	// Estimate initial capacity (adjust as needed)
+	queryBuilder.Grow(100 + len(table) + len(strings.Join(selectFields, ", ")))
+
+	queryBuilder.WriteString("SELECT ")
 	if len(selectFields) > 0 {
-		fields = strings.Join(selectFields, ", ")
+		queryBuilder.WriteString(strings.Join(selectFields, ", "))
+	} else {
+		queryBuilder.WriteByte('*')
 	}
-	query := fmt.Sprintf("SELECT %s FROM %s", fields, table)
-	whereClause, args, err := easyrest.BuildWhereClause(where)
+	queryBuilder.WriteString(" FROM ")
+	queryBuilder.WriteString(table) // Assuming table name is safe
+
+	whereClause, args, err := easyrest.BuildWhereClauseSorted(where)
 	if err != nil {
 		return nil, err
 	}
-	query += whereClause
+	queryBuilder.WriteString(whereClause)
+
 	if len(groupBy) > 0 {
-		query += " GROUP BY " + strings.Join(groupBy, ", ")
+		queryBuilder.WriteString(" GROUP BY ")
+		queryBuilder.WriteString(strings.Join(groupBy, ", "))
 	}
 	if len(ordering) > 0 {
-		query += " ORDER BY " + strings.Join(ordering, ", ")
+		queryBuilder.WriteString(" ORDER BY ")
+		queryBuilder.WriteString(strings.Join(ordering, ", "))
 	}
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		queryBuilder.WriteString(" LIMIT ")
+		queryBuilder.WriteString(strconv.Itoa(limit))
 	}
 	if offset > 0 {
-		query += fmt.Sprintf(" OFFSET %d", offset)
+		queryBuilder.WriteString(" OFFSET ")
+		queryBuilder.WriteString(strconv.Itoa(offset))
 	}
-	query = convertPlaceholders(query)
+
+	finalQuery := convertPlaceholders(queryBuilder.String())
 
 	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
 		ReadOnly:  true,
@@ -323,18 +340,40 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 
 	loc := time.UTC
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
-			return nil, err
+		// Initialize timezone cache if nil (robustness for tests)
+		if p.timezoneCache == nil {
+			p.timezoneCache = make(map[string]*time.Location)
 		}
+
+		// Apply context only if it's not empty
+		if len(ctx) > 0 {
+			if err := ApplyPluginContext(tx, ctx); err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+		}
+
 		if tz, ok := ctx["timezone"].(string); ok && tz != "" {
-			if l, err := time.LoadLocation(tz); err == nil {
-				loc = l
+			// Check cache first
+			var cachedLoc *time.Location
+			var found bool
+			if cachedLoc, found = p.timezoneCache[tz]; !found {
+				// Load and cache if not found
+				if l, err := time.LoadLocation(tz); err == nil {
+					p.timezoneCache[tz] = l
+					loc = l
+				} else {
+					// Log error but continue with UTC if loading fails
+					log.Printf("Warning: Could not load timezone '%s', using UTC: %v", tz, err)
+				}
+			} else {
+				// Use cached location
+				loc = cachedLoc
 			}
 		}
 	}
 
-	rows, err := tx.QueryContext(queryCtx, query, args...)
+	rows, err := tx.QueryContext(queryCtx, finalQuery, args...)
 	if err != nil {
 		tx.Rollback()
 		return nil, err
@@ -397,19 +436,44 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 	sort.Strings(keys)
 	colsStr := strings.Join(keys, ", ")
 
-	var valuePlaceholders []string
-	var args []any
+	// Pre-allocate slices based on data dimensions
+	numRows := len(data)
+	numCols := len(keys)
+	args := make([]any, 0, numRows*numCols)
+	valueStrings := make([]string, 0, numRows)
+	placeholderCounter := 1
+
 	for _, row := range data {
-		var ph []string
-		for _, k := range keys {
-			ph = append(ph, "?")
+		var rowPlaceholders strings.Builder
+		rowPlaceholders.Grow(numCols*4 + 1) // Estimate size like "($1,$2)"
+		rowPlaceholders.WriteByte('(')
+		for i, k := range keys {
+			if i > 0 {
+				rowPlaceholders.WriteByte(',')
+			}
+			rowPlaceholders.WriteByte('$')
+			rowPlaceholders.WriteString(strconv.Itoa(placeholderCounter))
 			args = append(args, row[k])
+			placeholderCounter++
 		}
-		valuePlaceholders = append(valuePlaceholders, "("+strings.Join(ph, ", ")+")")
+		rowPlaceholders.WriteByte(')')
+		valueStrings = append(valueStrings, rowPlaceholders.String())
 	}
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table, colsStr, strings.Join(valuePlaceholders, ", "))
-	query = convertPlaceholders(query)
-	if _, err := tx.ExecContext(context.Background(), query, args...); err != nil {
+
+	var queryBuilder strings.Builder
+	// Estimate capacity
+	queryBuilder.Grow(50 + len(table) + len(colsStr) + len(strings.Join(valueStrings, ", ")))
+
+	queryBuilder.WriteString("INSERT INTO ")
+	queryBuilder.WriteString(table)
+	queryBuilder.WriteString(" (")
+	queryBuilder.WriteString(colsStr)
+	queryBuilder.WriteString(") VALUES ")
+	queryBuilder.WriteString(strings.Join(valueStrings, ","))
+
+	finalQuery := queryBuilder.String() // No need for convertPlaceholders anymore
+
+	if _, err := tx.ExecContext(context.Background(), finalQuery, args...); err != nil {
 		// tx.Rollback() is handled by defer
 		return nil, err
 	}
@@ -509,22 +573,42 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 			return 0, err
 		}
 	}
-	var setParts []string
-	var args []any
-	for k, v := range data {
-		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
-		args = append(args, v)
+
+	// Pre-allocate slices
+	setParts := make([]string, 0, len(data))
+	args := make([]any, 0, len(data)) // Initial capacity for SET args
+
+	// Sort keys for deterministic query generation
+	dataKeys := make([]string, 0, len(data))
+	for k := range data {
+		dataKeys = append(dataKeys, k)
 	}
-	query := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
-	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+	sort.Strings(dataKeys)
+
+	for _, k := range dataKeys {
+		setParts = append(setParts, fmt.Sprintf("%s = ?", k)) // Keep fmt.Sprintf here as it's simple and clear
+		args = append(args, data[k])
+	}
+
+	whereClause, whereArgs, err := easyrest.BuildWhereClauseSorted(where)
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	query += whereClause
-	args = append(args, whereArgs...)
-	query = convertPlaceholders(query)
-	res, err := tx.ExecContext(context.Background(), query, args...)
+	args = append(args, whereArgs...) // Append WHERE args
+
+	var queryBuilder strings.Builder
+	queryBuilder.Grow(50 + len(table) + len(strings.Join(setParts, ", ")) + len(whereClause))
+
+	queryBuilder.WriteString("UPDATE ")
+	queryBuilder.WriteString(table)
+	queryBuilder.WriteString(" SET ")
+	queryBuilder.WriteString(strings.Join(setParts, ", "))
+	queryBuilder.WriteString(whereClause)
+
+	finalQuery := convertPlaceholders(queryBuilder.String())
+
+	res, err := tx.ExecContext(context.Background(), finalQuery, args...)
 	if err != nil {
 		// tx.Rollback() is handled by defer
 		return 0, err
@@ -535,7 +619,7 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 		return 0, err
 	}
 
-	// Conditionally commit or rollback
+	// Conditionally commit or rollback based on preference
 	if txPreference == "rollback" {
 		if err := tx.Rollback(); err != nil {
 			return 0, fmt.Errorf("failed to rollback transaction: %w", err)
@@ -571,14 +655,23 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 			return 0, err
 		}
 	}
-	whereClause, args, err := easyrest.BuildWhereClause(where)
+
+	whereClause, args, err := easyrest.BuildWhereClauseSorted(where)
 	if err != nil {
-		tx.Rollback()
+		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	query := fmt.Sprintf("DELETE FROM %s%s", table, whereClause)
-	query = convertPlaceholders(query)
-	res, err := tx.ExecContext(context.Background(), query, args...)
+
+	var queryBuilder strings.Builder
+	queryBuilder.Grow(20 + len(table) + len(whereClause))
+
+	queryBuilder.WriteString("DELETE FROM ")
+	queryBuilder.WriteString(table)
+	queryBuilder.WriteString(whereClause)
+
+	finalQuery := convertPlaceholders(queryBuilder.String())
+
+	res, err := tx.ExecContext(context.Background(), finalQuery, args...)
 	if err != nil {
 		// tx.Rollback() is handled by defer
 		return 0, err
@@ -622,17 +715,27 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	var placeholders []string
-	var args []any
+
+	// Pre-allocate slices
+	placeholders := make([]string, 0, len(keys))
+	args := make([]any, 0, len(keys))
+
 	for _, k := range keys {
 		placeholders = append(placeholders, "?")
 		args = append(args, data[k])
 	}
+	placeholdersStr := strings.Join(placeholders, ", ")
 
-	// Use function name directly, assuming it's safe or properly quoted if needed.
-	// The SELECT syntax automatically handles potential multiple return values (SETOF).
-	query := fmt.Sprintf("SELECT * FROM %s(%s)", funcName, strings.Join(placeholders, ", "))
-	query = convertPlaceholders(query)
+	var queryBuilder strings.Builder
+	queryBuilder.Grow(20 + len(funcName) + len(placeholdersStr))
+
+	queryBuilder.WriteString("SELECT * FROM ")
+	queryBuilder.WriteString(funcName)
+	queryBuilder.WriteString("(")
+	queryBuilder.WriteString(placeholdersStr)
+	queryBuilder.WriteString(")")
+
+	finalQuery := convertPlaceholders(queryBuilder.String())
 
 	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
 		// Although function calls might modify data,
@@ -661,7 +764,7 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 		}
 	}
 
-	rows, err := tx.QueryContext(queryCtx, query, args...)
+	rows, err := tx.QueryContext(queryCtx, finalQuery, args...)
 	if err != nil {
 		// Check for specific PostgreSQL error indicating function doesn't return SETOF
 		// This might require checking the pgerr code. For now, general error handling.
@@ -754,10 +857,12 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 // convertPlaceholders replaces each "?" in the query with PostgreSQL-style "$1", "$2", etc.
 func convertPlaceholders(query string) string {
 	var builder strings.Builder
+	builder.Grow(len(query) + 10) // Pre-allocate buffer slightly larger than original query
 	counter := 1
 	for i := 0; i < len(query); i++ {
 		if query[i] == '?' {
-			builder.WriteString(fmt.Sprintf("$%d", counter))
+			builder.WriteByte('$')
+			builder.WriteString(strconv.Itoa(counter)) // Use strconv.Itoa for efficiency
 			counter++
 		} else {
 			builder.WriteByte(query[i])
