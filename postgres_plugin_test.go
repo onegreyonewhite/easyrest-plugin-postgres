@@ -284,8 +284,17 @@ func TestGetSchema(t *testing.T) {
 	rpcRows := pgxmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).
 		AddRow("fnTest", "fnTest", "integer")
 	// Expect exact SQL string
-	mock.ExpectQuery(`SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'`).
-		WillReturnRows(rpcRows)
+	mock.ExpectQuery(`
+	SELECT r.routine_name, r.specific_name, r.data_type
+	FROM information_schema.routines r
+	JOIN pg_catalog.pg_proc p ON r.routine_name = p.proname
+	JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = p.oid AND dep.classid = 'pg_catalog.pg_proc'::regclass AND dep.deptype = 'e'
+	WHERE r.specific_schema = 'public'
+	  AND n.nspname = 'public' -- Ensure the schema matches in both catalogs
+	  AND r.routine_type = 'FUNCTION'
+	  AND dep.objid IS NULL -- Only include functions NOT dependent on an extension
+	`).WillReturnRows(rpcRows)
 	paramRows := pgxmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).
 		AddRow("x", "integer", "IN", 1)
 	// Expect exact SQL string
@@ -408,7 +417,17 @@ func TestGetSchemaComprehensive(t *testing.T) {
 	// Mock functions query
 	functionRows := pgxmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).AddRow("calculate_total", "calculate_total_123", "numeric")
 	// Expect exact SQL string
-	mock.ExpectQuery(`SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'`).WillReturnRows(functionRows)
+	mock.ExpectQuery(`
+	SELECT r.routine_name, r.specific_name, r.data_type
+	FROM information_schema.routines r
+	JOIN pg_catalog.pg_proc p ON r.routine_name = p.proname
+	JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = p.oid AND dep.classid = 'pg_catalog.pg_proc'::regclass AND dep.deptype = 'e'
+	WHERE r.specific_schema = 'public'
+	  AND n.nspname = 'public' -- Ensure the schema matches in both catalogs
+	  AND r.routine_type = 'FUNCTION'
+	  AND dep.objid IS NULL -- Only include functions NOT dependent on an extension
+	`).WillReturnRows(functionRows)
 	// Mock function parameters query
 	paramRows := pgxmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).AddRow("user_id", "integer", "IN", 1).AddRow("start_date", "date", "IN", 2)
 	// Expect exact SQL string

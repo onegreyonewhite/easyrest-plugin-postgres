@@ -24,7 +24,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.0"
+var Version = "v0.5.1"
 
 var bgCtx = context.Background()
 
@@ -847,6 +847,9 @@ func (p *pgPlugin) getTablesSchema(tx pgx.Tx) (map[string]any, error) {
 			rows.Close()
 			return nil, err
 		}
+		if tn == "easyrest_cache" {
+			continue
+		}
 		tableNames = append(tableNames, tn)
 	}
 	rows.Close()
@@ -951,7 +954,18 @@ func (p *pgPlugin) getViewsSchema(tx pgx.Tx) (map[string]any, error) {
 // getRPCSchema builds schemas for stored functions.
 func (p *pgPlugin) getRPCSchema(tx pgx.Tx) (map[string]any, error) {
 	result := make(map[string]any)
-	rpcQuery := "SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'"
+	// Exclude functions belonging to extensions by checking pg_depend
+	rpcQuery := `
+	SELECT r.routine_name, r.specific_name, r.data_type
+	FROM information_schema.routines r
+	JOIN pg_catalog.pg_proc p ON r.routine_name = p.proname
+	JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+	LEFT JOIN pg_catalog.pg_depend dep ON dep.objid = p.oid AND dep.classid = 'pg_catalog.pg_proc'::regclass AND dep.deptype = 'e'
+	WHERE r.specific_schema = 'public'
+	  AND n.nspname = 'public' -- Ensure the schema matches in both catalogs
+	  AND r.routine_type = 'FUNCTION'
+	  AND dep.objid IS NULL -- Only include functions NOT dependent on an extension
+	`
 	rows, err := tx.Query(bgCtx, rpcQuery)
 	if err != nil {
 		return nil, err
