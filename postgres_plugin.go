@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -17,39 +18,28 @@ import (
 
 	"github.com/goccy/go-json"
 	hplugin "github.com/hashicorp/go-plugin"
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.4.0"
+var Version = "v0.5.0"
 
-type sqlOpener interface {
-	Open(driverName, dataSourceName string) (*sql.DB, error)
-}
+var bgCtx = context.Background()
 
-type defaultSQLOpener struct{}
-
-func (o *defaultSQLOpener) Open(driverName, dataSourceName string) (*sql.DB, error) {
-	return sql.Open(driverName, dataSourceName)
-}
-
-// Add interface for testing purposes
-type sqlDB interface {
-	SetMaxOpenConns(n int)
-	SetMaxIdleConns(n int)
-	SetConnMaxLifetime(d time.Duration)
-	SetConnMaxIdleTime(d time.Duration)
-	Ping() error
-	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
-	Close() error
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+// DBPool abstracts pgxpool.Pool and pgxmock.PgxPoolIface for production and testing
+// Only the methods used in pgPlugin are included
+type DBPool interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // pgPlugin implements the DBPlugin interface for PostgreSQL.
 type pgPlugin struct {
-	db             sqlDB
-	opener         sqlOpener
+	db             DBPool
 	defaultTimeout time.Duration             // Default timeout for operations
 	bulkThreshold  int                       // Threshold for bulk operations
 	timezoneCache  map[string]*time.Location // Cache for loaded timezones
@@ -60,101 +50,123 @@ func (p *pgPlugin) newContextWithTimeout() (context.Context, context.CancelFunc)
 	if p.defaultTimeout == 0 {
 		p.defaultTimeout = 30 * time.Second
 	}
-	return context.WithTimeout(context.Background(), p.defaultTimeout)
+	return context.WithTimeout(bgCtx, p.defaultTimeout)
 }
 
-// InitConnection opens a PostgreSQL connection using a URI with the prefix "postgres://".
-func (p *pgPlugin) InitConnection(uri string) error {
-	if p.opener == nil {
-		p.opener = &defaultSQLOpener{}
-	}
-
+// parseConnectionParams extracts plugin-specific parameters from the URI query,
+// returning the base DSN and parsed values.
+func parseConnectionParams(uri string) (dsn string, maxConns int32, minConns int32, maxLifetime, maxIdleTime time.Duration, timeout time.Duration, bulkThreshold int, autoCleanup string, err error) {
 	if !strings.HasPrefix(uri, "postgres://") {
-		return errors.New("invalid postgres URI")
+		err = errors.New("invalid postgres URI")
+		return
 	}
 
 	parsedURI, err := url.Parse(uri)
 	if err != nil {
-		return err
+		return
 	}
 
 	queryParams := parsedURI.Query()
+	// Default values
 	maxOpenConns := 100
 	maxIdleConns := 25
-	connMaxLifetime := 5
-	connMaxIdleTime := 10
-	timeout := 30        // Timeout in seconds
-	bulkThreshold := 100 // Threshold for bulk operations
+	connMaxLifetimeMin := 5
+	connMaxIdleTimeMin := 10
+	timeoutSec := 30
+	bulkThresholdVal := 100
 
-	// Remove connection parameters from query before creating DSN
-	if val := queryParams.Get("maxOpenConns"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &maxOpenConns); err != nil || n != 1 {
-			return fmt.Errorf("invalid maxOpenConns value: %s", val)
+	// Helper to parse integer query params
+	parseInt := func(key string, target *int) error {
+		if valStr := queryParams.Get(key); valStr != "" {
+			parsedVal, parseErr := strconv.Atoi(valStr)
+			if parseErr != nil {
+				return fmt.Errorf("invalid %s value: %s", key, valStr)
+			}
+			*target = parsedVal
+			queryParams.Del(key) // Remove param after parsing
 		}
+		return nil
 	}
-	queryParams.Del("maxOpenConns")
 
-	if val := queryParams.Get("maxIdleConns"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &maxIdleConns); err != nil || n != 1 {
-			return fmt.Errorf("invalid maxIdleConns value: %s", val)
-		}
+	// Parse integer parameters
+	if err = parseInt("maxOpenConns", &maxOpenConns); err != nil {
+		return
 	}
-	queryParams.Del("maxIdleConns")
-
-	if val := queryParams.Get("connMaxLifetime"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &connMaxLifetime); err != nil || n != 1 {
-			return fmt.Errorf("invalid connMaxLifetime value: %s", val)
-		}
+	if err = parseInt("maxIdleConns", &maxIdleConns); err != nil {
+		return
 	}
-	queryParams.Del("connMaxLifetime")
-
-	if val := queryParams.Get("connMaxIdleTime"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &connMaxIdleTime); err != nil || n != 1 {
-			return fmt.Errorf("invalid connMaxIdleTime value: %s", val)
-		}
+	if err = parseInt("connMaxLifetime", &connMaxLifetimeMin); err != nil {
+		return
 	}
-	queryParams.Del("connMaxIdleTime")
-
-	if val := queryParams.Get("timeout"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &timeout); err != nil || n != 1 {
-			return fmt.Errorf("invalid timeout value: %s", val)
-		}
+	if err = parseInt("connMaxIdleTime", &connMaxIdleTimeMin); err != nil {
+		return
 	}
-	queryParams.Del("timeout")
-
-	if val := queryParams.Get("bulkThreshold"); val != "" {
-		if n, err := fmt.Sscanf(val, "%d", &bulkThreshold); err != nil || n != 1 {
-			return fmt.Errorf("invalid bulkThreshold value: %s", val)
-		}
+	if err = parseInt("timeout", &timeoutSec); err != nil {
+		return
 	}
-	queryParams.Del("bulkThreshold")
-	queryParams.Del("autoCleanup")
+	if err = parseInt("bulkThreshold", &bulkThresholdVal); err != nil {
+		return
+	}
 
+	// Get autoCleanup (string)
+	autoCleanup = queryParams.Get("autoCleanup")
+	queryParams.Del("autoCleanup") // Remove even if empty
+
+	// Re-encode URI to form the base DSN
 	parsedURI.RawQuery = queryParams.Encode()
-	dsn := parsedURI.String()
+	dsn = parsedURI.String()
 
-	db, err := p.opener.Open("postgres", dsn)
+	// Assign parsed values to return variables
+	maxConns = int32(maxOpenConns)
+	minConns = int32(maxIdleConns) // pgxpool uses MinConns
+	maxLifetime = time.Duration(connMaxLifetimeMin) * time.Minute
+	maxIdleTime = time.Duration(connMaxIdleTimeMin) * time.Minute
+	timeout = time.Duration(timeoutSec) * time.Second
+	bulkThreshold = bulkThresholdVal
+
+	return // Return parsed values and DSN
+}
+
+// InitConnection opens a PostgreSQL connection using a URI with the prefix "postgres://".
+func (p *pgPlugin) InitConnection(uri string) error {
+	dsn, maxConns, minConns, maxLifetime, maxIdleTime, timeout, bulkThreshold, _, err := parseConnectionParams(uri)
 	if err != nil {
+		// Propagate parsing errors
 		return err
 	}
 
-	if db != nil {
-		db.SetMaxOpenConns(maxOpenConns)
-		db.SetMaxIdleConns(maxIdleConns)
-		db.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Minute)
-		db.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Minute)
-		p.defaultTimeout = time.Duration(timeout) * time.Second
-		p.bulkThreshold = bulkThreshold
-
-		ctx, cancel := p.newContextWithTimeout()
-		defer cancel()
-
-		if err := db.PingContext(ctx); err != nil {
-			return err
-		}
-		p.db = db
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("failed to parse base DSN: %w", err)
 	}
-	p.timezoneCache = make(map[string]*time.Location)
+
+	// Apply parsed parameters to the config
+	cfg.MaxConns = maxConns
+	cfg.MinConns = minConns
+	cfg.MaxConnLifetime = maxLifetime
+	cfg.MaxConnIdleTime = maxIdleTime
+
+	// Create the pool using the configured settings
+	db, err := pgxpool.NewWithConfig(bgCtx, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create connection pool: %w", err)
+	}
+
+	// Assign plugin settings
+	p.defaultTimeout = timeout
+	p.bulkThreshold = bulkThreshold
+
+	// Ping the database to verify connection
+	pingCtx, cancel := context.WithTimeout(bgCtx, 5*time.Second) // Use a short ping timeout
+	defer cancel()
+	if err := db.Ping(pingCtx); err != nil {
+		db.Close() // Ensure pool is closed on ping failure
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Assign the pool to the plugin
+	p.db = db
+	p.timezoneCache = make(map[string]*time.Location) // Initialize cache
 
 	return nil
 }
@@ -197,32 +209,42 @@ func getTxPreference(ctx map[string]any) (string, error) {
 // For each key, it sets two variables: one with prefix "request." (complex types are marshaled to JSON)
 // and one with prefix "erctx." using the default string representation.
 // Keys are processed in sorted order.
-func ApplyPluginContext(tx *sql.Tx, ctx map[string]any) error {
-	// Collect and sort keys.
-	keys := make([]string, 0, len(ctx))
-	for k := range ctx {
-		keys = append(keys, k)
+func ApplyPluginContext(ctx context.Context, tx pgx.Tx, pluginCtx map[string]any) error {
+	if len(pluginCtx) == 0 {
+		return nil
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		val := ctx[key]
-		var requestVal string
-		switch val.(type) {
+	for key, val := range pluginCtx {
+		var requestVal, erctxVal string
+		switch v := val.(type) {
+		case string:
+			requestVal = v
+			erctxVal = v
+		case int, int8, int16, int32, int64:
+			requestVal = fmt.Sprintf("%d", v)
+			erctxVal = requestVal
+		case float32, float64:
+			requestVal = fmt.Sprintf("%f", v)
+			erctxVal = requestVal
+		case bool:
+			requestVal = fmt.Sprintf("%t", v)
+			erctxVal = requestVal
 		case map[string]any, []any:
-			b, err := json.Marshal(val)
+			b, err := json.Marshal(v)
 			if err != nil {
 				return err
 			}
 			requestVal = string(b)
+			erctxVal = string(b)
 		default:
-			requestVal = fmt.Sprintf("%v", val)
+			strVal := fmt.Sprintf("%v", v)
+			requestVal = strVal
+			erctxVal = strVal
 		}
-		erctxVal := fmt.Sprintf("%v", val)
 		query := "SELECT set_config($1, $2, true)"
-		if _, err := tx.ExecContext(context.Background(), query, "request."+key, requestVal); err != nil {
+		if _, err := tx.Exec(ctx, query, "request."+key, requestVal); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(context.Background(), query, "erctx."+key, erctxVal); err != nil {
+		if _, err := tx.Exec(ctx, query, "erctx."+key, erctxVal); err != nil {
 			return err
 		}
 	}
@@ -230,58 +252,36 @@ func ApplyPluginContext(tx *sql.Tx, ctx map[string]any) error {
 }
 
 // processRows processes query results in batches
-func (p *pgPlugin) processRows(rows *sql.Rows, loc *time.Location) ([]map[string]any, error) {
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
+func (p *pgPlugin) processRows(rows pgx.Rows, loc *time.Location) ([]map[string]any, error) {
+	cols := rows.FieldDescriptions()
 	numCols := len(cols)
-
-	// Pre-allocate memory for results
 	results := make([]map[string]any, 0, 1000)
-
-	// Reuse slices for scanning
-	columns := make([]any, numCols)
-	columnPointers := make([]any, numCols)
-	for i := range columns {
-		columnPointers[i] = &columns[i]
-	}
-
-	// Process results in batches
-	const batchSize = 1000
-	batch := make([]map[string]any, 0, batchSize)
-
 	for rows.Next() {
-		if err := rows.Scan(columnPointers...); err != nil {
+		values, err := rows.Values()
+		if err != nil {
 			return nil, err
 		}
-
 		rowMap := make(map[string]any, numCols)
-		for i, colName := range cols {
-			if t, ok := columns[i].(time.Time); ok {
-				adjusted := t.In(loc)
+		for i, col := range cols {
+			val := values[i]
+			switch v := val.(type) {
+			case time.Time:
+				adjusted := v.In(loc)
 				if adjusted.Hour() == 0 && adjusted.Minute() == 0 && adjusted.Second() == 0 && adjusted.Nanosecond() == 0 {
-					rowMap[colName] = adjusted.Format("2006-01-02")
+					rowMap[string(col.Name)] = adjusted.Format("2006-01-02")
 				} else {
-					rowMap[colName] = adjusted.Format("2006-01-02 15:04:05")
+					rowMap[string(col.Name)] = adjusted.Format("2006-01-02 15:04:05")
 				}
-			} else {
-				rowMap[colName] = columns[i]
+			case []byte:
+				rowMap[string(col.Name)] = string(v)
+			case string, int, int8, int16, int32, int64, float32, float64, bool:
+				rowMap[string(col.Name)] = v
+			default:
+				rowMap[string(col.Name)] = fmt.Sprintf("%v", v)
 			}
 		}
-
-		batch = append(batch, rowMap)
-		if len(batch) >= batchSize {
-			results = append(results, batch...)
-			batch = batch[:0] // Clear batch while preserving allocated memory
-		}
+		results = append(results, rowMap)
 	}
-
-	// Add remaining results
-	if len(batch) > 0 {
-		results = append(results, batch...)
-	}
-
 	return results, nil
 }
 
@@ -293,7 +293,6 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 	defer cancel()
 
 	var queryBuilder strings.Builder
-	// Estimate initial capacity (adjust as needed)
 	queryBuilder.Grow(100 + len(table) + len(strings.Join(selectFields, ", ")))
 
 	queryBuilder.WriteString("SELECT ")
@@ -303,7 +302,7 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 		queryBuilder.WriteByte('*')
 	}
 	queryBuilder.WriteString(" FROM ")
-	queryBuilder.WriteString(table) // Assuming table name is safe
+	queryBuilder.WriteString(table)
 
 	whereClause, args, err := easyrest.BuildWhereClauseSorted(where)
 	if err != nil {
@@ -330,63 +329,53 @@ func (p *pgPlugin) TableGet(userID, table string, selectFields []string, where m
 
 	finalQuery := convertPlaceholders(queryBuilder.String())
 
-	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
-		ReadOnly:  true,
-		Isolation: sql.LevelReadCommitted,
-	})
+	tx, err := p.db.Begin(queryCtx)
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback(queryCtx)
 
 	loc := time.UTC
 	if ctx != nil {
-		// Initialize timezone cache if nil (robustness for tests)
 		if p.timezoneCache == nil {
 			p.timezoneCache = make(map[string]*time.Location)
 		}
-
-		// Apply context only if it's not empty
 		if len(ctx) > 0 {
-			if err := ApplyPluginContext(tx, ctx); err != nil {
-				tx.Rollback()
+			if err := ApplyPluginContext(queryCtx, tx, ctx); err != nil {
+				tx.Rollback(queryCtx)
 				return nil, err
 			}
 		}
-
 		if tz, ok := ctx["timezone"].(string); ok && tz != "" {
-			// Check cache first
 			var cachedLoc *time.Location
 			var found bool
 			if cachedLoc, found = p.timezoneCache[tz]; !found {
-				// Load and cache if not found
 				if l, err := time.LoadLocation(tz); err == nil {
 					p.timezoneCache[tz] = l
 					loc = l
 				} else {
-					// Log error but continue with UTC if loading fails
 					log.Printf("Warning: Could not load timezone '%s', using UTC: %v", tz, err)
 				}
 			} else {
-				// Use cached location
 				loc = cachedLoc
 			}
 		}
 	}
 
-	rows, err := tx.QueryContext(queryCtx, finalQuery, args...)
+	rows, err := tx.Query(queryCtx, finalQuery, args...)
 	if err != nil {
-		tx.Rollback()
+		tx.Rollback(queryCtx)
 		return nil, err
 	}
 	defer rows.Close()
 
 	results, err := p.processRows(rows, loc)
 	if err != nil {
-		tx.Rollback()
+		tx.Rollback(queryCtx)
 		return nil, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(queryCtx); err != nil {
 		return nil, err
 	}
 
@@ -415,15 +404,15 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 		return p.bulkCreate(table, data, ctx) // bulkCreate handles its own commit
 	}
 
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.Begin(bgCtx)
 	if err != nil {
 		return nil, err
 	}
 	// Defer rollback in case of errors before the final commit/rollback decision
-	defer tx.Rollback() // This will be ignored if Commit() or Rollback() is called explicitly later
+	defer tx.Rollback(bgCtx) // This will be ignored if Commit() or Rollback() is called explicitly later
 
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
+		if err := ApplyPluginContext(bgCtx, tx, ctx); err != nil {
 			// tx.Rollback() is handled by defer
 			return nil, err
 		}
@@ -443,9 +432,11 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 	valueStrings := make([]string, 0, numRows)
 	placeholderCounter := 1
 
+	var rowPlaceholders strings.Builder
+	rowPlaceholders.Grow(numCols*4 + 1) // Estimate size like "($1,$2)"
+
 	for _, row := range data {
-		var rowPlaceholders strings.Builder
-		rowPlaceholders.Grow(numCols*4 + 1) // Estimate size like "($1,$2)"
+		rowPlaceholders.Reset()
 		rowPlaceholders.WriteByte('(')
 		for i, k := range keys {
 			if i > 0 {
@@ -473,20 +464,20 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 
 	finalQuery := queryBuilder.String() // No need for convertPlaceholders anymore
 
-	if _, err := tx.ExecContext(context.Background(), finalQuery, args...); err != nil {
+	if _, err := tx.Exec(bgCtx, finalQuery, args...); err != nil {
 		// tx.Rollback() is handled by defer
 		return nil, err
 	}
 
 	// Conditionally commit or rollback based on preference
 	if txPreference == "rollback" {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(bgCtx); err != nil {
 			return nil, fmt.Errorf("failed to rollback transaction: %w", err)
 		}
 		// Return the data as if it were inserted, even though rolled back
 		return data, nil
 	} else {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(bgCtx); err != nil {
 			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		return data, nil
@@ -494,58 +485,43 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 }
 
 // bulkCreate uses COPY for efficient insertion of large amounts of data
-// TODO: Refactor bulkCreate to accept a transaction and respect txPreference if needed.
 func (p *pgPlugin) bulkCreate(table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
-	// Note: This function currently manages its own transaction and always commits.
-	// The txPreference logic is handled in TableCreate before calling this.
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.Begin(bgCtx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get column list
 	keys := make([]string, 0, len(data[0]))
 	for k := range data[0] {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	// Create temporary table for COPY
-	tempTable := fmt.Sprintf("temp_%s_%d", table, time.Now().UnixNano())
-	createTempSQL := fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s) ON COMMIT DROP", tempTable, table)
-	if _, err := tx.ExecContext(context.Background(), createTempSQL); err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to create temp table: %v", err)
+	// Build pgx CopyFromSource
+	records := make([][]any, len(data))
+	for i, row := range data {
+		rowVals := make([]any, len(keys))
+		for j, k := range keys {
+			rowVals[j] = row[k]
+		}
+		records[i] = rowVals
 	}
 
-	// Prepare COPY statement
-	stmt, err := tx.PrepareContext(context.Background(), fmt.Sprintf("COPY %s (%s) FROM STDIN", tempTable, strings.Join(keys, ", ")))
+	columns := make([]string, len(keys))
+	copy(columns, keys)
+
+	_, err = tx.CopyFrom(
+		bgCtx,
+		pgx.Identifier{table},
+		columns,
+		pgx.CopyFromRows(records),
+	)
 	if err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to prepare COPY statement: %v", err)
-	}
-	defer stmt.Close()
-
-	// Copy data
-	for _, row := range data {
-		values := make([]any, len(keys))
-		for i, key := range keys {
-			values[i] = row[key]
-		}
-		if _, err := stmt.ExecContext(context.Background(), values...); err != nil {
-			tx.Rollback()
-			return nil, fmt.Errorf("failed to copy row: %v", err)
-		}
+		tx.Rollback(bgCtx)
+		return nil, err
 	}
 
-	// Insert data from temporary table into target
-	insertSQL := fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", table, tempTable)
-	if _, err := tx.ExecContext(context.Background(), insertSQL); err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to insert from temp table: %v", err)
-	}
-
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(bgCtx); err != nil {
 		return nil, err
 	}
 
@@ -560,15 +536,15 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 		return 0, err
 	}
 
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.Begin(bgCtx)
 	if err != nil {
 		return 0, err
 	}
 	// Defer rollback in case of errors
-	defer tx.Rollback()
+	defer tx.Rollback(bgCtx)
 
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
+		if err := ApplyPluginContext(bgCtx, tx, ctx); err != nil {
 			// tx.Rollback() is handled by defer
 			return 0, err
 		}
@@ -608,26 +584,22 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 
 	finalQuery := convertPlaceholders(queryBuilder.String())
 
-	res, err := tx.ExecContext(context.Background(), finalQuery, args...)
+	res, err := tx.Exec(bgCtx, finalQuery, args...)
 	if err != nil {
 		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		// tx.Rollback() is handled by defer
-		return 0, err
-	}
+	affected := res.RowsAffected()
 
 	// Conditionally commit or rollback based on preference
 	if txPreference == "rollback" {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(bgCtx); err != nil {
 			return 0, fmt.Errorf("failed to rollback transaction: %w", err)
 		}
 		// Return affected rows count even if rolled back
 		return int(affected), nil
 	} else {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(bgCtx); err != nil {
 			return 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		return int(affected), nil
@@ -642,15 +614,15 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 		return 0, err
 	}
 
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.Begin(bgCtx)
 	if err != nil {
 		return 0, err
 	}
 	// Defer rollback in case of errors
-	defer tx.Rollback()
+	defer tx.Rollback(bgCtx)
 
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
+		if err := ApplyPluginContext(bgCtx, tx, ctx); err != nil {
 			// tx.Rollback() is handled by defer
 			return 0, err
 		}
@@ -671,26 +643,22 @@ func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx m
 
 	finalQuery := convertPlaceholders(queryBuilder.String())
 
-	res, err := tx.ExecContext(context.Background(), finalQuery, args...)
+	res, err := tx.Exec(bgCtx, finalQuery, args...)
 	if err != nil {
 		// tx.Rollback() is handled by defer
 		return 0, err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		// tx.Rollback() is handled by defer
-		return 0, err
-	}
+	affected := res.RowsAffected()
 
 	// Conditionally commit or rollback
 	if txPreference == "rollback" {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(bgCtx); err != nil {
 			return 0, fmt.Errorf("failed to rollback transaction: %w", err)
 		}
 		// Return affected rows count even if rolled back
 		return int(affected), nil
 	} else {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(bgCtx); err != nil {
 			return 0, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		return int(affected), nil
@@ -737,22 +705,15 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 
 	finalQuery := convertPlaceholders(queryBuilder.String())
 
-	tx, err := p.db.BeginTx(queryCtx, &sql.TxOptions{
-		// Although function calls might modify data,
-		// we often use ReadCommitted for functions primarily reading data
-		// or when the function itself manages transactionality.
-		// Consider making this configurable if needed.
-		ReadOnly:  false, // Functions can modify data
-		Isolation: sql.LevelReadCommitted,
-	})
+	tx, err := p.db.Begin(queryCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if commit fails or not reached
+	defer tx.Rollback(queryCtx)
 
 	loc := time.UTC
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
+		if err := ApplyPluginContext(queryCtx, tx, ctx); err != nil {
 			return nil, fmt.Errorf("failed to apply plugin context: %w", err)
 		}
 		if tz, ok := ctx["timezone"].(string); ok && tz != "" {
@@ -764,7 +725,7 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 		}
 	}
 
-	rows, err := tx.QueryContext(queryCtx, finalQuery, args...)
+	rows, err := tx.Query(queryCtx, finalQuery, args...)
 	if err != nil {
 		// Check for specific PostgreSQL error indicating function doesn't return SETOF
 		// This might require checking the pgerr code. For now, general error handling.
@@ -787,12 +748,12 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 	// Conditionally commit or rollback based on preference
 	var finalErr error
 	if txPreference == "rollback" {
-		if err := tx.Rollback(); err != nil {
+		if err := tx.Rollback(queryCtx); err != nil {
 			finalErr = fmt.Errorf("failed to rollback transaction: %w", err)
 		}
 		// No need to log here, behavior is intentional
 	} else {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(queryCtx); err != nil {
 			finalErr = fmt.Errorf("failed to commit transaction: %w", err)
 		}
 	}
@@ -856,26 +817,26 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 
 // convertPlaceholders replaces each "?" in the query with PostgreSQL-style "$1", "$2", etc.
 func convertPlaceholders(query string) string {
-	var builder strings.Builder
-	builder.Grow(len(query) + 10) // Pre-allocate buffer slightly larger than original query
+	var buf bytes.Buffer
+	buf.Grow(len(query) + 10)
 	counter := 1
-	for i := 0; i < len(query); i++ {
+	for i := range len(query) {
 		if query[i] == '?' {
-			builder.WriteByte('$')
-			builder.WriteString(strconv.Itoa(counter)) // Use strconv.Itoa for efficiency
+			buf.WriteByte('$')
+			buf.WriteString(strconv.Itoa(counter))
 			counter++
 		} else {
-			builder.WriteByte(query[i])
+			buf.WriteByte(query[i])
 		}
 	}
-	return builder.String()
+	return buf.String()
 }
 
 // getTablesSchema builds a schema for each base table from information_schema.
-func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]any, error) {
+func (p *pgPlugin) getTablesSchema(tx pgx.Tx) (map[string]any, error) {
 	result := make(map[string]any)
 	tableQuery := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
-	rows, err := tx.QueryContext(context.Background(), tableQuery)
+	rows, err := tx.Query(bgCtx, tableQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -891,12 +852,12 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]any, error) {
 	rows.Close()
 	for _, tn := range tableNames {
 		colQuery := "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
-		colRows, err := tx.QueryContext(context.Background(), colQuery, tn)
+		colRows, err := tx.Query(bgCtx, colQuery, tn)
 		if err != nil {
 			return nil, err
 		}
 		properties := make(map[string]any)
-		var required []string
+		required := make([]string, 0, 8)
 		for colRows.Next() {
 			var colName, dataType, isNullable string
 			var colDefault sql.NullString
@@ -930,10 +891,10 @@ func (p *pgPlugin) getTablesSchema(tx *sql.Tx) (map[string]any, error) {
 }
 
 // getViewsSchema builds a schema for each view from information_schema.
-func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]any, error) {
+func (p *pgPlugin) getViewsSchema(tx pgx.Tx) (map[string]any, error) {
 	result := make(map[string]any)
 	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'"
-	rows, err := tx.QueryContext(context.Background(), query)
+	rows, err := tx.Query(bgCtx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -949,12 +910,12 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]any, error) {
 	rows.Close()
 	for _, vn := range viewNames {
 		colQuery := "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1"
-		colRows, err := tx.QueryContext(context.Background(), colQuery, vn)
+		colRows, err := tx.Query(bgCtx, colQuery, vn)
 		if err != nil {
 			return nil, err
 		}
 		properties := make(map[string]any)
-		var required []string
+		required := make([]string, 0, 8)
 		for colRows.Next() {
 			var colName, dataType, isNullable string
 			var colDefault sql.NullString
@@ -988,10 +949,10 @@ func (p *pgPlugin) getViewsSchema(tx *sql.Tx) (map[string]any, error) {
 }
 
 // getRPCSchema builds schemas for stored functions.
-func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]any, error) {
+func (p *pgPlugin) getRPCSchema(tx pgx.Tx) (map[string]any, error) {
 	result := make(map[string]any)
 	rpcQuery := "SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'"
-	rows, err := tx.QueryContext(context.Background(), rpcQuery)
+	rows, err := tx.Query(bgCtx, rpcQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -1015,12 +976,12 @@ func (p *pgPlugin) getRPCSchema(tx *sql.Tx) (map[string]any, error) {
 	rows.Close()
 	for _, r := range routines {
 		paramQuery := "SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters WHERE specific_schema = 'public' AND specific_name = $1 ORDER BY ordinal_position"
-		paramRows, err := tx.QueryContext(context.Background(), paramQuery, r.specificName)
+		paramRows, err := tx.Query(bgCtx, paramQuery, r.specificName)
 		if err != nil {
 			return nil, err
 		}
 		properties := make(map[string]any)
-		var reqFields []string
+		reqFields := make([]string, 0, 4)
 		for paramRows.Next() {
 			var paramName sql.NullString
 			var dataType, paramMode string
@@ -1090,32 +1051,32 @@ func mapPostgresType(dt string) string {
 // GetSchema returns a schema object with "tables", "views" and "rpc" keys.
 // It applies the provided context to the session before retrieving the schema.
 func (p *pgPlugin) GetSchema(ctx map[string]any) (any, error) {
-	tx, err := p.db.BeginTx(context.Background(), nil)
+	tx, err := p.db.Begin(bgCtx)
 	if err != nil {
 		return nil, err
 	}
 	if ctx != nil {
-		if err := ApplyPluginContext(tx, ctx); err != nil {
-			tx.Rollback()
+		if err := ApplyPluginContext(bgCtx, tx, ctx); err != nil {
+			tx.Rollback(bgCtx)
 			return nil, err
 		}
 	}
 	tables, err := p.getTablesSchema(tx)
 	if err != nil {
-		tx.Rollback()
+		tx.Rollback(bgCtx)
 		return nil, err
 	}
 	views, err := p.getViewsSchema(tx)
 	if err != nil {
-		tx.Rollback()
+		tx.Rollback(bgCtx)
 		return nil, err
 	}
 	rpc, err := p.getRPCSchema(tx)
 	if err != nil {
-		tx.Rollback()
+		tx.Rollback(bgCtx)
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(bgCtx); err != nil {
 		return nil, err
 	}
 	return map[string]any{
@@ -1134,27 +1095,16 @@ type pgCachePlugin struct {
 // It relies on the underlying pgPlugin's InitConnection being called first or concurrently
 // by the plugin framework to establish the database connection.
 func (p *pgCachePlugin) InitConnection(uri string) error {
-	parsedURL, err := url.Parse(uri)
+	// Parse params to get autoCleanup and the base DSN for the main plugin
+	dsn, _, _, _, _, _, _, autoCleanup, err := parseConnectionParams(uri)
 	if err != nil {
-		return fmt.Errorf("failed to parse URI: %w", err)
+		return fmt.Errorf("failed to parse URI for cache: %w", err)
 	}
 
-	// Get the autoCleanup query parameter
-	autoCleanup := parsedURL.Query().Get("autoCleanup")
-
-	// Remove the autoCleanup parameter from the URI
-	query := parsedURL.Query()
-	query.Del("autoCleanup")
-	parsedURL.RawQuery = query.Encode()
-	uri = parsedURL.String()
-
-	// Ensure the underlying DB connection is initialized.
-	// This might be redundant if the framework guarantees calling InitConnection on the DB plugin first,
-	// but it ensures dbPluginPointer.db is available.
+	// Ensure the underlying DB connection is initialized *using the base DSN*.
 	if p.dbPluginPointer.db == nil {
-		// Attempt to initialize the main plugin connection if not already done.
-		// This assumes the same URI is used for both db and cache plugins.
-		err := p.dbPluginPointer.InitConnection(uri)
+		// Use the base DSN (without pool params) to initialize the main plugin
+		err := p.dbPluginPointer.InitConnection(dsn)
 		if err != nil {
 			return fmt.Errorf("failed to initialize underlying db connection for cache: %w", err)
 		}
@@ -1166,24 +1116,40 @@ func (p *pgCachePlugin) InitConnection(uri string) error {
 	}
 
 	// Create cache table if it doesn't exist
-	// Use TIMESTAMPTZ for timezone awareness
 	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS easyrest_cache (
-		key TEXT PRIMARY KEY,
-		value TEXT,
-		expires_at TIMESTAMPTZ
-	);`
-	// Use a background context as table creation is an initialization step.
-	_, err = p.dbPluginPointer.db.ExecContext(context.Background(), createTableSQL)
+	CREATE TABLE IF NOT EXISTS easyrest_cache ( ` +
+		`key TEXT PRIMARY KEY, ` +
+		`value TEXT, ` +
+		`expires_at TIMESTAMPTZ` +
+		` );`
+	// Use the established db pool to execute the command
+	_, err = p.dbPluginPointer.db.Exec(bgCtx, createTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create cache table: %w", err)
 	}
 
-	// Launch background goroutine for cleanup
+	// Launch background goroutine for cleanup if requested
 	if autoCleanup == "true" || autoCleanup == "1" {
 		go p.cleanupExpiredCacheEntries()
 	}
 
+	return nil
+}
+
+// deleteExpiredEntries performs a single cleanup run.
+func (p *pgCachePlugin) deleteExpiredEntries(ctx context.Context) error {
+	if p.dbPluginPointer.db == nil {
+		// Don't return error, just log, as the cleanup goroutine should continue.
+		fmt.Fprintf(os.Stderr, "Error cleaning cache: DB connection is nil\n")
+		return nil
+	}
+	// Use NOW() which corresponds to TIMESTAMPTZ
+	_, err := p.dbPluginPointer.db.Exec(ctx, "DELETE FROM easyrest_cache WHERE expires_at <= NOW()")
+	if err != nil {
+		// Log the error, but don't necessarily stop the goroutine.
+		fmt.Fprintf(os.Stderr, "Error cleaning up expired cache entries: %v\n", err)
+		return err // Return error so tests can check it if needed
+	}
 	return nil
 }
 
@@ -1194,18 +1160,10 @@ func (p *pgCachePlugin) cleanupExpiredCacheEntries() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if p.dbPluginPointer.db == nil {
-			// Log error if db connection is lost, but keep trying
-			fmt.Fprintf(os.Stderr, "Error cleaning cache: DB connection is nil\n")
-			continue // Skip this cycle
-		}
-		// Use NOW() which corresponds to TIMESTAMPTZ
-		// Use background context for cleanup task.
-		_, err := p.dbPluginPointer.db.ExecContext(context.Background(), "DELETE FROM easyrest_cache WHERE expires_at <= NOW()")
-		if err != nil {
-			// Log the error, but continue running the cleanup
-			fmt.Fprintf(os.Stderr, "Error cleaning up expired cache entries: %v\n", err)
-		}
+		// Call the synchronous cleanup function.
+		// Use background context for the periodic task itself.
+		_ = p.deleteExpiredEntries(bgCtx)
+		// We ignore the error here because the loop should continue regardless.
 	}
 }
 
@@ -1224,7 +1182,7 @@ func (p *pgCachePlugin) Set(key string, value string, ttl time.Duration) error {
 		expires_at = EXCLUDED.expires_at;`
 
 	// Use background context for simple cache operation.
-	_, err := p.dbPluginPointer.db.ExecContext(context.Background(), query, key, value, expiresAt)
+	_, err := p.dbPluginPointer.db.Exec(bgCtx, query, key, value, expiresAt)
 	if err != nil {
 		return fmt.Errorf("failed to set cache entry: %w", err)
 	}
@@ -1240,7 +1198,7 @@ func (p *pgCachePlugin) Get(key string) (string, error) {
 	query := "SELECT value FROM easyrest_cache WHERE key = $1 AND expires_at > NOW()"
 
 	// Use background context for simple cache operation.
-	err := p.dbPluginPointer.db.QueryRowContext(context.Background(), query, key).Scan(&value)
+	err := p.dbPluginPointer.db.QueryRow(bgCtx, query, key).Scan(&value)
 	if err != nil {
 		// Return standard sql.ErrNoRows if not found or expired, otherwise the specific error
 		if errors.Is(err, sql.ErrNoRows) {

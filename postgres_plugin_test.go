@@ -2,76 +2,32 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jackc/pgx/v5"
+	easyrest "github.com/onegreyonewhite/easyrest/plugin"
+	pgxmock "github.com/pashagolub/pgxmock/v4"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// Mock for DB
-type mockDB struct {
-	maxOpenConns    int
-	maxIdleConns    int
-	connMaxLifetime time.Duration
-}
-
-func (m *mockDB) SetMaxOpenConns(n int) {
-	m.maxOpenConns = n
-}
-
-func (m *mockDB) SetMaxIdleConns(n int) {
-	m.maxIdleConns = n
-}
-
-func (m *mockDB) SetConnMaxLifetime(d time.Duration) {
-	m.connMaxLifetime = d
-}
-
-func (m *mockDB) Ping() error {
-	return nil
-}
-
-// Mock for opener
-type mockSQLOpener struct {
-	mockDB *sql.DB
-}
-
-func (o *mockSQLOpener) Open(driverName, dataSourceName string) (*sql.DB, error) {
-	return o.mockDB, nil
-}
-
-func newTestPlugin(t *testing.T) (*pgPlugin, sqlmock.Sqlmock) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+// newTestPlugin returns a pgPlugin and pgxmock.PgxPoolIface for testing with pgxpool
+func newTestPlugin(t *testing.T) (*pgPlugin, pgxmock.PgxPoolIface) {
+	// Use QueryMatcherEqual for exact SQL string matching by default
+	mockPool, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
 	if err != nil {
-		t.Fatalf("failed to open sqlmock database: %s", err)
+		t.Fatalf("failed to open pgxmock pool: %s", err)
 	}
-	plugin := &pgPlugin{db: db}
-	return plugin, mock
-}
-
-func TestInitConnectionValid(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	mock.ExpectPing()
-
-	plugin := &pgPlugin{
-		opener: &mockSQLOpener{mockDB: db},
-	}
-
-	err = plugin.InitConnection("postgres://user:pass@localhost:5432/db")
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
+	// Use mockPool which implements DBPool interface
+	plugin := &pgPlugin{db: mockPool}
+	return plugin, mockPool
 }
 
 func TestConvertPlaceholders(t *testing.T) {
@@ -85,15 +41,15 @@ func TestConvertPlaceholders(t *testing.T) {
 
 func TestTableGet(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
 	selectFields := []string{"id", "name"}
 	where := map[string]any{
 		"status": map[string]any{"=": "active"},
 	}
 	mock.ExpectBegin()
-	queryRegex := regexp.QuoteMeta(`SELECT id, name FROM users WHERE status = $1`)
-	rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "John Doe")
-	mock.ExpectQuery(queryRegex).WithArgs("active").WillReturnRows(rows)
+	// Expect exact SQL string without QuoteMeta or escapes
+	mock.ExpectQuery(`SELECT id, name FROM users WHERE status = $1`).
+		WithArgs("active").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "name"}).AddRow(1, "John Doe"))
 	mock.ExpectCommit()
 	result, err := plugin.TableGet("user1", "users", selectFields, where, nil, nil, 0, 0, nil)
 	if err != nil {
@@ -112,22 +68,21 @@ func TestTableGet(t *testing.T) {
 
 func TestTableGetSelectFieldSubstitution(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	ctx := map[string]any{
-		"claims_sub": "sub_value",
-	}
+	ctx := map[string]any{"claims_sub": "sub_value"}
 	selectFields := []string{"id", "erctx.claims_sub"}
 	where := map[string]any{}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+	// Expect exact SQL string
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("request.claims_sub", "sub_value").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("erctx.claims_sub", "sub_value").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	expectedQueryRegex := regexp.QuoteMeta("SELECT id, erctx.claims_sub FROM users")
-	rows := sqlmock.NewRows([]string{"id", "erctx.claims_sub"}).AddRow(10, "sub_value")
-	mock.ExpectQuery(expectedQueryRegex).WithArgs().WillReturnRows(rows)
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT id, erctx.claims_sub FROM users`).
+		WithArgs().
+		WillReturnRows(pgxmock.NewRows([]string{"id", "erctx.claims_sub"}).AddRow(10, "sub_value"))
 	mock.ExpectCommit()
 	result, err := plugin.TableGet("user1", "users", selectFields, where, nil, nil, 0, 0, ctx)
 	if err != nil {
@@ -146,23 +101,22 @@ func TestTableGetSelectFieldSubstitution(t *testing.T) {
 
 func TestTableGetTimeWithTimezone(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
 	utcTime := time.Date(2025, 3, 7, 15, 30, 0, 0, time.UTC)
-	// In America/New_York (UTC-5), expected time becomes 10:30.
 	expectedTime := "2025-03-07 10:30:00"
 	selectFields := []string{"id", "created_at"}
 	where := map[string]any{"dummy": "val"}
-	expQ := "SELECT id, created_at FROM dummy WHERE dummy = $1"
-	rows := sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, utcTime)
+	// Expect exact SQL string
+	expQ := `SELECT id, created_at FROM dummy WHERE dummy = $1`
+	rows := pgxmock.NewRows([]string{"id", "created_at"}).AddRow(1, utcTime)
 	mock.ExpectBegin()
-	// Expect setting timezone.
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+	// Expect exact SQL string
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("request.timezone", "America/New_York").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("erctx.timezone", "America/New_York").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(expQ)).WithArgs("val").WillReturnRows(rows)
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(expQ).WithArgs("val").WillReturnRows(rows)
 	mock.ExpectCommit()
 	ctxData := map[string]any{
 		"timezone": "America/New_York",
@@ -183,38 +137,27 @@ func TestTableGetTimeWithTimezone(t *testing.T) {
 }
 
 func TestTableCreate(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	plugin := &pgPlugin{
-		db:            db,
-		bulkThreshold: 1000, // Set high threshold to avoid bulk operations in this test
-	}
-
+	plugin, mock := newTestPlugin(t)
+	plugin.bulkThreshold = 1000
 	data := []map[string]any{
 		{"id": 1, "name": "Test1"},
 		{"id": 2, "name": "Test2"},
 		{"id": 3, "name": "Test3"},
 	}
-
 	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO users \\(id, name\\) VALUES \\(\\$1,\\$2\\),\\(\\$3,\\$4\\),\\(\\$5,\\$6\\)").
+	// Expect exact SQL string
+	mock.ExpectExec("INSERT INTO users (id, name) VALUES ($1,$2),($3,$4),($5,$6)").
 		WithArgs(1, "Test1", 2, "Test2", 3, "Test3").
-		WillReturnResult(sqlmock.NewResult(0, 3))
+		WillReturnResult(pgxmock.NewResult("INSERT", 3))
 	mock.ExpectCommit()
 
 	result, err := plugin.TableCreate("test_user", "users", data, nil)
 	if err != nil {
 		t.Errorf("TableCreate error: %v", err)
 	}
-
 	if len(result) != len(data) {
 		t.Errorf("Expected %d results, got %d", len(data), len(result))
 	}
-
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("Unfulfilled expectations: %v", err)
 	}
@@ -222,17 +165,13 @@ func TestTableCreate(t *testing.T) {
 
 func TestTableUpdate(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	data := map[string]any{
-		"name": "Bob",
-	}
-	where := map[string]any{
-		"id": map[string]any{"=": 1},
-	}
+	data := map[string]any{"name": "Bob"}
+	where := map[string]any{"id": map[string]any{"=": 1}}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET name = $1 WHERE id = $2`)).
+	// Expect exact SQL string
+	mock.ExpectExec(`UPDATE users SET name = $1 WHERE id = $2`).
 		WithArgs("Bob", 1).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()
 	affected, err := plugin.TableUpdate("user1", "users", data, where, nil)
 	if err != nil {
@@ -248,14 +187,12 @@ func TestTableUpdate(t *testing.T) {
 
 func TestTableDelete(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	where := map[string]any{
-		"status": map[string]any{"=": "inactive"},
-	}
+	where := map[string]any{"status": map[string]any{"=": "inactive"}}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM users WHERE status = $1`)).
+	// Expect exact SQL string
+	mock.ExpectExec(`DELETE FROM users WHERE status = $1`).
 		WithArgs("inactive").
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectCommit()
 	affected, err := plugin.TableDelete("user1", "users", where, nil)
 	if err != nil {
@@ -271,27 +208,20 @@ func TestTableDelete(t *testing.T) {
 
 func TestCallFunction(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	data := map[string]any{
-		"param": "value",
-	}
+	data := map[string]any{"param": "value"}
 	funcName := "doSomething"
 	expectedResult := "Processed: value"
-
 	mock.ExpectBegin()
-	// Updated query expectation to match the new format SELECT * FROM funcName(...)
-	queryRegex := regexp.QuoteMeta(fmt.Sprintf(`SELECT * FROM %s($1)`, funcName))
-	// Mock the result based on what processRows expects
-	rows := sqlmock.NewRows([]string{"doSomething"}).AddRow(expectedResult)
-	mock.ExpectQuery(queryRegex).WithArgs("value").WillReturnRows(rows)
+	// Expect exact SQL string
+	query := fmt.Sprintf(`SELECT * FROM %s($1)`, funcName)
+	rows := pgxmock.NewRows([]string{"doSomething"}).AddRow(expectedResult)
+	mock.ExpectQuery(query).WithArgs("value").WillReturnRows(rows)
 	mock.ExpectCommit()
-
 	result, err := plugin.CallFunction("user1", funcName, data, nil)
 	if err != nil {
 		t.Fatalf("CallFunction error: %s", err)
 	}
 
-	// The modified CallFunction now returns the scalar value directly
 	resultStr, ok := result.(string)
 	if !ok {
 		t.Fatalf("Expected result to be a string, got %T", result)
@@ -308,48 +238,60 @@ func TestCallFunction(t *testing.T) {
 
 func TestGetSchema(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-	ctxData := map[string]any{
-		"timezone": "UTC",
-	}
+	ctxData := map[string]any{"timezone": "UTC"}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+	// Expect exact SQL string
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("request.timezone", "UTC").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(regexp.QuoteMeta("SELECT set_config($1, $2, true)")).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 		WithArgs("erctx.timezone", "UTC").
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	// Base tables.
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'")).
-		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("users").AddRow("orders"))
+	tableRows := pgxmock.NewRows([]string{"table_name"}).AddRow("users").AddRow("orders")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`).
+		WillReturnRows(tableRows)
 	// Columns for "users".
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1")).
+	userCols := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("id", "integer", "NO", nil).
+		AddRow("name", "character varying", "YES", nil)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).
 		WithArgs("users").
-		WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-			AddRow("id", "integer", "NO", nil).
-			AddRow("name", "character varying", "YES", nil))
+		WillReturnRows(userCols)
 	// Columns for "orders".
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1")).
+	orderCols := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("id", "integer", "NO", nil).
+		AddRow("amount", "numeric", "YES", nil)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).
 		WithArgs("orders").
-		WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-			AddRow("id", "integer", "NO", nil).
-			AddRow("amount", "numeric", "YES", nil))
+		WillReturnRows(orderCols)
 	// Views.
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'")).
-		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("myview"))
+	viewRows := pgxmock.NewRows([]string{"table_name"}).AddRow("myview")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'`).
+		WillReturnRows(viewRows)
 	// Columns for view "myview".
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1")).
+	viewCols := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
+		AddRow("vcol", "text", "YES", nil)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).
 		WithArgs("myview").
-		WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-			AddRow("vcol", "text", "YES", nil))
+		WillReturnRows(viewCols)
 	// RPC functions.
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'")).
-		WillReturnRows(sqlmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).
-			AddRow("fnTest", "fnTest", "integer"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters WHERE specific_schema = 'public' AND specific_name = $1 ORDER BY ordinal_position")).
+	rpcRows := pgxmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).
+		AddRow("fnTest", "fnTest", "integer")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'`).
+		WillReturnRows(rpcRows)
+	paramRows := pgxmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).
+		AddRow("x", "integer", "IN", 1)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters WHERE specific_schema = 'public' AND specific_name = $1 ORDER BY ordinal_position`).
 		WithArgs("fnTest").
-		WillReturnRows(sqlmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).
-			AddRow("x", "integer", "IN", 1))
+		WillReturnRows(paramRows)
 	mock.ExpectCommit()
 	schema, err := plugin.GetSchema(ctxData)
 	if err != nil {
@@ -370,179 +312,9 @@ func TestGetSchema(t *testing.T) {
 	}
 }
 
-func TestInitConnectionWithParams(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	mock.ExpectPing()
-
-	plugin := &pgPlugin{
-		opener: &mockSQLOpener{mockDB: db},
-	}
-
-	uri := "postgres://user:pass@localhost:5432/db?maxOpenConns=50&maxIdleConns=10&connMaxLifetime=15&connMaxIdleTime=20&timeout=60"
-	err = plugin.InitConnection(uri)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-
-	if plugin.defaultTimeout != 60*time.Second {
-		t.Errorf("Expected timeout 60s, got %v", plugin.defaultTimeout)
-	}
-}
-
-func TestInitConnectionDefaults(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	mock.ExpectPing()
-
-	plugin := &pgPlugin{
-		opener: &mockSQLOpener{mockDB: db},
-	}
-
-	uri := "postgres://user:pass@localhost:5432/db"
-	err = plugin.InitConnection(uri)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-
-	if plugin.defaultTimeout != 30*time.Second {
-		t.Errorf("Expected default timeout 30s, got %v", plugin.defaultTimeout)
-	}
-}
-
-func TestInitConnectionInvalidURI(t *testing.T) {
-	plugin := &pgPlugin{
-		opener: &mockSQLOpener{},
-	}
-
-	err := plugin.InitConnection("invalid://uri")
-	if err == nil {
-		t.Error("Expected error for invalid URI")
-	}
-}
-
-func TestInitConnectionInvalidParams(t *testing.T) {
-	tests := []struct {
-		name string
-		uri  string
-	}{
-		{
-			name: "Invalid maxOpenConns",
-			uri:  "postgres://user:pass@localhost:5432/db?maxOpenConns=invalid",
-		},
-		{
-			name: "Invalid maxIdleConns",
-			uri:  "postgres://user:pass@localhost:5432/db?maxIdleConns=invalid",
-		},
-		{
-			name: "Invalid connMaxLifetime",
-			uri:  "postgres://user:pass@localhost:5432/db?connMaxLifetime=invalid",
-		},
-		{
-			name: "Invalid connMaxIdleTime",
-			uri:  "postgres://user:pass@localhost:5432/db?connMaxIdleTime=invalid",
-		},
-		{
-			name: "Invalid timeout",
-			uri:  "postgres://user:pass@localhost:5432/db?timeout=invalid",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			plugin := &pgPlugin{
-				opener: &mockSQLOpener{},
-			}
-
-			err := plugin.InitConnection(tt.uri)
-			if err == nil {
-				t.Error("Expected error for invalid parameter")
-			}
-		})
-	}
-}
-
-func TestInitConnectionWithBulkThreshold(t *testing.T) {
-	tests := []struct {
-		name          string
-		uri           string
-		expectedValue int
-		expectError   bool
-	}{
-		{
-			name:          "Default bulk threshold",
-			uri:           "postgres://user:pass@localhost:5432/db",
-			expectedValue: 100,
-			expectError:   false,
-		},
-		{
-			name:          "Custom bulk threshold",
-			uri:           "postgres://user:pass@localhost:5432/db?bulkThreshold=500",
-			expectedValue: 500,
-			expectError:   false,
-		},
-		{
-			name:          "Invalid bulk threshold",
-			uri:           "postgres://user:pass@localhost:5432/db?bulkThreshold=invalid",
-			expectedValue: 0,
-			expectError:   true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db, mock, err := sqlmock.New()
-			if err != nil {
-				t.Fatalf("Failed to create mock: %v", err)
-			}
-			defer db.Close()
-
-			mock.ExpectPing()
-
-			plugin := &pgPlugin{
-				opener: &mockSQLOpener{mockDB: db},
-			}
-
-			err = plugin.InitConnection(tt.uri)
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("Unexpected error: %v", err)
-				return
-			}
-
-			if plugin.bulkThreshold != tt.expectedValue {
-				t.Errorf("Expected bulk threshold %d, got %d", tt.expectedValue, plugin.bulkThreshold)
-			}
-		})
-	}
-}
-
 func TestTableCreateWithBulkOperations(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	plugin := &pgPlugin{
-		db:            db,
-		bulkThreshold: 2, // Set low threshold for testing
-	}
-
+	plugin, mock := newTestPlugin(t)
+	plugin.bulkThreshold = 2
 	tests := []struct {
 		name        string
 		data        []map[string]any
@@ -574,16 +346,14 @@ func TestTableCreateWithBulkOperations(t *testing.T) {
 			mock.ExpectBegin()
 
 			if tt.expectBulk {
-				mock.ExpectExec("CREATE TEMP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
-				mock.ExpectPrepare("COPY")
-				for range tt.data {
-					mock.ExpectExec("COPY").WillReturnResult(sqlmock.NewResult(0, 1))
-				}
-				mock.ExpectExec("INSERT INTO").WillReturnResult(sqlmock.NewResult(0, int64(len(tt.data))))
+				// Expect CopyFrom for bulk operation
+				mock.ExpectCopyFrom(pgx.Identifier{"test_table"}, []string{"id", "name"}).
+					WillReturnResult(int64(len(tt.data)))
 			} else {
-				mock.ExpectExec("INSERT INTO").
+				// Expect exact SQL string for regular insert
+				mock.ExpectExec("INSERT INTO test_table (id, name) VALUES ($1,$2)").
 					WithArgs(tt.data[0]["id"], tt.data[0]["name"]).
-					WillReturnResult(sqlmock.NewResult(0, 1))
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			}
 
 			mock.ExpectCommit()
@@ -595,16 +365,13 @@ func TestTableCreateWithBulkOperations(t *testing.T) {
 				}
 				return
 			}
-
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 				return
 			}
-
 			if len(result) != len(tt.data) {
 				t.Errorf("Expected %d results, got %d", len(tt.data), len(result))
 			}
-
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("Unfulfilled expectations: %v", err)
 			}
@@ -613,145 +380,88 @@ func TestTableCreateWithBulkOperations(t *testing.T) {
 }
 
 func TestGetSchemaComprehensive(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	plugin := &pgPlugin{
-		db: db,
-	}
-
-	// Mock context application
+	plugin, mock := newTestPlugin(t)
 	mock.ExpectBegin()
-	mock.ExpectExec("SELECT set_config").WithArgs("request.user", "test_user").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("SELECT set_config").WithArgs("erctx.user", "test_user").WillReturnResult(sqlmock.NewResult(0, 1))
-
+	// Expect exact SQL string
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).WithArgs("request.user", "test_user").WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`SELECT set_config($1, $2, true)`).WithArgs("erctx.user", "test_user").WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	// Mock tables query
-	tableRows := sqlmock.NewRows([]string{"table_name"}).
-		AddRow("users").
-		AddRow("products")
-	mock.ExpectQuery("SELECT table_name FROM information_schema.tables").WillReturnRows(tableRows)
-
+	tableRows := pgxmock.NewRows([]string{"table_name"}).AddRow("users").AddRow("products")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`).WillReturnRows(tableRows)
 	// Mock columns query for users table
-	userColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-		AddRow("id", "integer", "NO", nil).
-		AddRow("name", "character varying", "NO", nil).
-		AddRow("created_at", "timestamp", "YES", "CURRENT_TIMESTAMP")
-	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
-		WithArgs("users").
-		WillReturnRows(userColumns)
-
+	userColumns := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).AddRow("id", "integer", "NO", nil).AddRow("name", "character varying", "NO", nil).AddRow("created_at", "timestamp", "YES", "CURRENT_TIMESTAMP")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).WithArgs("users").WillReturnRows(userColumns)
 	// Mock columns query for products table
-	productColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-		AddRow("id", "integer", "NO", nil).
-		AddRow("name", "character varying", "NO", nil).
-		AddRow("price", "numeric", "NO", nil)
-	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
-		WithArgs("products").
-		WillReturnRows(productColumns)
-
+	productColumns := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).AddRow("id", "integer", "NO", nil).AddRow("name", "character varying", "NO", nil).AddRow("price", "numeric", "NO", nil)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).WithArgs("products").WillReturnRows(productColumns)
 	// Mock views query
-	viewRows := sqlmock.NewRows([]string{"table_name"}).
-		AddRow("user_stats")
-	mock.ExpectQuery("SELECT table_name FROM information_schema.tables.*VIEW").WillReturnRows(viewRows)
-
+	viewRows := pgxmock.NewRows([]string{"table_name"}).AddRow("user_stats")
+	// Expect exact SQL string - Note: Adjusted regex slightly if it was .*VIEW
+	mock.ExpectQuery(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'VIEW'`).WillReturnRows(viewRows)
 	// Mock columns query for view
-	viewColumns := sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).
-		AddRow("user_id", "integer", "YES", nil).
-		AddRow("total_orders", "bigint", "YES", nil)
-	mock.ExpectQuery("SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns").
-		WithArgs("user_stats").
-		WillReturnRows(viewColumns)
-
+	viewColumns := pgxmock.NewRows([]string{"column_name", "data_type", "is_nullable", "column_default"}).AddRow("user_id", "integer", "YES", nil).AddRow("total_orders", "bigint", "YES", nil)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`).WithArgs("user_stats").WillReturnRows(viewColumns)
 	// Mock functions query
-	functionRows := sqlmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).
-		AddRow("calculate_total", "calculate_total_123", "numeric")
-	mock.ExpectQuery("SELECT routine_name, specific_name, data_type FROM information_schema.routines").
-		WillReturnRows(functionRows)
-
+	functionRows := pgxmock.NewRows([]string{"routine_name", "specific_name", "data_type"}).AddRow("calculate_total", "calculate_total_123", "numeric")
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT routine_name, specific_name, data_type FROM information_schema.routines WHERE specific_schema = 'public' AND routine_type = 'FUNCTION'`).WillReturnRows(functionRows)
 	// Mock function parameters query
-	paramRows := sqlmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).
-		AddRow("user_id", "integer", "IN", 1).
-		AddRow("start_date", "date", "IN", 2)
-	mock.ExpectQuery("SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters").
-		WithArgs("calculate_total_123").
-		WillReturnRows(paramRows)
-
+	paramRows := pgxmock.NewRows([]string{"parameter_name", "data_type", "parameter_mode", "ordinal_position"}).AddRow("user_id", "integer", "IN", 1).AddRow("start_date", "date", "IN", 2)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT parameter_name, data_type, parameter_mode, ordinal_position FROM information_schema.parameters WHERE specific_schema = 'public' AND specific_name = $1 ORDER BY ordinal_position`).WithArgs("calculate_total_123").WillReturnRows(paramRows)
 	mock.ExpectCommit()
-
-	ctx := map[string]any{
-		"user": "test_user",
-	}
-
-	schema, err := plugin.GetSchema(ctx)
+	schema, err := plugin.GetSchema(map[string]any{"user": "test_user"})
 	if err != nil {
 		t.Fatalf("GetSchema failed: %v", err)
 	}
-
 	schemaMap, ok := schema.(map[string]any)
 	if !ok {
 		t.Fatal("Schema is not a map")
 	}
-
 	// Verify tables
 	tables, ok := schemaMap["tables"].(map[string]any)
 	if !ok {
 		t.Fatal("Tables schema is not a map")
 	}
-
 	// Check users table
 	usersSchema, ok := tables["users"].(map[string]any)
 	if !ok {
 		t.Fatal("Users table schema is not a map")
 	}
-
 	usersProps, ok := usersSchema["properties"].(map[string]any)
 	if !ok {
 		t.Fatal("Users properties is not a map")
 	}
-
 	if _, ok := usersProps["id"]; !ok {
 		t.Error("Users schema missing id field")
 	}
-
 	// Check views
 	views, ok := schemaMap["views"].(map[string]any)
 	if !ok {
 		t.Fatal("Views schema is not a map")
 	}
-
 	if _, ok := views["user_stats"]; !ok {
 		t.Error("Views schema missing user_stats view")
 	}
-
 	// Check RPC
 	rpc, ok := schemaMap["rpc"].(map[string]any)
 	if !ok {
 		t.Fatal("RPC schema is not a map")
 	}
-
 	if _, ok := rpc["calculate_total"]; !ok {
 		t.Error("RPC schema missing calculate_total function")
 	}
-
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("Unfulfilled expectations: %v", err)
 	}
 }
 
 func TestTableDeleteComprehensive(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("Failed to create mock: %v", err)
-	}
-	defer db.Close()
-
-	plugin := &pgPlugin{
-		db: db,
-	}
-
+	plugin, mock := newTestPlugin(t)
 	tests := []struct {
 		name        string
 		table       string
@@ -800,21 +510,21 @@ func TestTableDeleteComprehensive(t *testing.T) {
 
 			if tt.ctx != nil {
 				for k, v := range tt.ctx {
-					mock.ExpectExec("SELECT set_config").
+					// Expect exact SQL string
+					mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 						WithArgs("request."+k, fmt.Sprintf("%v", v)).
-						WillReturnResult(sqlmock.NewResult(0, 1))
-					mock.ExpectExec("SELECT set_config").
+						WillReturnResult(pgxmock.NewResult("SELECT", 1))
+					mock.ExpectExec(`SELECT set_config($1, $2, true)`).
 						WithArgs("erctx."+k, fmt.Sprintf("%v", v)).
-						WillReturnResult(sqlmock.NewResult(0, 1))
+						WillReturnResult(pgxmock.NewResult("SELECT", 1))
 				}
 			}
 
-			whereClause := "DELETE FROM " + tt.table
-			if len(tt.where) > 0 {
-				whereClause += " WHERE"
-			}
-
-			mock.ExpectExec(whereClause).WillReturnResult(sqlmock.NewResult(0, tt.affected))
+			whereClause, args, _ := easyrest.BuildWhereClauseSorted(tt.where)
+			// Expect the final query *after* placeholder conversion
+			expectedSQL := convertPlaceholders("DELETE FROM " + tt.table + whereClause)
+			mock.ExpectExec(expectedSQL).WithArgs(args...).
+				WillReturnResult(pgxmock.NewResult("DELETE", tt.affected))
 			mock.ExpectCommit()
 
 			affected, err := plugin.TableDelete("test_user", tt.table, tt.where, tt.ctx)
@@ -824,16 +534,13 @@ func TestTableDeleteComprehensive(t *testing.T) {
 				}
 				return
 			}
-
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 				return
 			}
-
 			if int64(affected) != tt.affected {
 				t.Errorf("Expected %d affected rows, got %d", tt.affected, affected)
 			}
-
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("Unfulfilled expectations: %v", err)
 			}
@@ -841,138 +548,199 @@ func TestTableDeleteComprehensive(t *testing.T) {
 	}
 }
 
-// newTestPluginWithCache creates a pgPlugin, pgCachePlugin, and sqlmock instance for testing.
-func newTestPluginWithCache(t *testing.T) (*pgPlugin, *pgCachePlugin, sqlmock.Sqlmock) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp)) // Use Regexp matcher
+// newTestPluginWithCache creates a pgPlugin, pgCachePlugin, and pgxmock.PgxPoolIface for testing.
+func newTestPluginWithCache(t *testing.T) (*pgPlugin, *pgCachePlugin, pgxmock.PgxPoolIface) {
+	// Use QueryMatcherEqual for exact SQL string matching by default
+	mockPool, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherEqual))
 	if err != nil {
-		t.Fatalf("failed to open sqlmock database: %s", err)
+		t.Fatalf("failed to open pgxmock pool: %s", err)
 	}
-	// Create the main plugin instance with the mock DB
-	plugin := &pgPlugin{db: db}
-	// Create the cache plugin instance, pointing to the main plugin
+	plugin := &pgPlugin{db: mockPool}
 	cachePlugin := &pgCachePlugin{dbPluginPointer: plugin}
-	return plugin, cachePlugin, mock
+	return plugin, cachePlugin, mockPool
 }
 
 func TestPgCachePluginInitConnection(t *testing.T) {
-	// 1. Setup: Create plugin instances and the mock DB connection
 	plugin, cachePlugin, mock := newTestPluginWithCache(t)
-	// Ensure the mock DB is closed after the test
-	defer plugin.db.Close()
+	// Expect exact single-line SQL string
+	expectedSQL := `CREATE TABLE IF NOT EXISTS easyrest_cache ( key TEXT PRIMARY KEY, value TEXT, expires_at TIMESTAMPTZ );`
+	mock.ExpectExec(expectedSQL).
+		WillReturnResult(pgxmock.NewResult("CREATE TABLE", 1))
 
-	// 2. Expectation: Mock the SQL query that InitConnection should execute
-	// It expects "CREATE TABLE IF NOT EXISTS easyrest_cache ..."
-	mock.ExpectExec("CREATE TABLE IF NOT EXISTS easyrest_cache").
-		WillReturnResult(sqlmock.NewResult(0, 0)) // Expect success (no rows affected is fine for CREATE TABLE)
-
-	// 3. Action: Call the InitConnection method on the cache plugin instance
-	// Provide a dummy URI; in the test, the DB connection comes from the mock setup,
-	// but InitConnection might internally call the main plugin's InitConnection if db is nil.
 	err := cachePlugin.InitConnection("postgres://user:pass@localhost:5432/db")
-
-	// 4. Assertion: Check if there was an error during initialization
 	if err != nil {
 		t.Fatalf("cachePlugin.InitConnection failed: %v", err)
 	}
-
-	// 5. Verification: Ensure that the expected SQL query was actually executed
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations in TestPgCachePluginInitConnection: %s", err)
 	}
-	// Note: Testing the background cleanup goroutine directly is complex in unit tests.
-	// We assume it's started if InitConnection succeeds without error.
+	_ = plugin // Use plugin to avoid unused variable error if cache init uses it
 }
 
 func TestPgCachePluginSetGet(t *testing.T) {
-	plugin, cachePlugin, mock := newTestPluginWithCache(t)
-	defer plugin.db.Close()
-
+	_, cachePlugin, mock := newTestPluginWithCache(t)
 	key := "testKey"
 	value := "testValue"
 	ttl := 5 * time.Minute
-	expiresAt := time.Now().Add(ttl) // Approximate expected time
 
 	// --- Test Set ---
-	// Mock the INSERT ... ON CONFLICT query called by the Set method
-	// Use sqlmock.AnyArg() for expiresAt, as the exact time might differ slightly
-	mock.ExpectExec("INSERT INTO easyrest_cache .* ON CONFLICT").
-		WithArgs(key, value, sqlmock.AnyArg()).   // Check key, value, and any timestamp
-		WillReturnResult(sqlmock.NewResult(1, 1)) // Expect successful insertion/update of 1 row
+	// Expect exact SQL string, use AnyArg for expires_at - corrected syntax
+	expectedSetSQL := `INSERT INTO easyrest_cache (key, value, expires_at) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at;`
+	mock.ExpectExec(expectedSetSQL).
+		WithArgs(key, value, pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
-	// Call the Set method
 	err := cachePlugin.Set(key, value, ttl)
 	if err != nil {
 		t.Fatalf("cachePlugin.Set failed: %v", err)
 	}
 
 	// --- Test Get (successful) ---
-	// Mock the SELECT query called by the Get method
-	rows := sqlmock.NewRows([]string{"value"}).AddRow(value) // Prepare result rows
-	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
-		WithArgs(key).       // Check that the query is executed with the correct key
-		WillReturnRows(rows) // Return the prepared rows
+	rows := pgxmock.NewRows([]string{"value"}).AddRow(value)
+	// Expect exact SQL string
+	mock.ExpectQuery(`SELECT value FROM easyrest_cache WHERE key = $1 AND expires_at > NOW()`).
+		WithArgs(key).
+		WillReturnRows(rows)
 
-	// Call the Get method
 	retrievedValue, err := cachePlugin.Get(key)
 	if err != nil {
 		t.Fatalf("cachePlugin.Get failed: %v", err)
 	}
-
-	// Check that the retrieved value matches the expected value
 	if retrievedValue != value {
 		t.Errorf("expected value '%s', got '%s'", value, retrievedValue)
 	}
-
-	// Check that all mock expectations were met
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestPgCachePluginSetGet: %s", err)
+		t.Errorf("unfulfilled expectations in TestPgCachePluginSetGet (successful get): %s", err)
 	}
 
 	// --- Test Get (key not found) ---
-	// Mock the SELECT query for a non-existent key
-	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
+	mock.ExpectQuery(`SELECT value FROM easyrest_cache WHERE key = $1 AND expires_at > NOW()`).
 		WithArgs("nonExistentKey").
-		WillReturnError(sql.ErrNoRows) // Expect sql.ErrNoRows error (standard for cache miss)
+		WillReturnError(pgx.ErrNoRows)
 
-	// Call Get for the non-existent key
 	_, err = cachePlugin.Get("nonExistentKey")
-	// Check that the specific sql.ErrNoRows error was returned
+	// Check against sql.ErrNoRows for broader compatibility
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("expected sql.ErrNoRows for non-existent key, got %v", err)
 	}
-
-	// Check mock expectations again
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations after non-existent key check: %s", err)
 	}
-
-	// Optional: More complex validation of the exact expiresAt time could be added,
-	// but it would require extracting the argument from sqlmock.AnyArg().
-	_ = expiresAt // Use expiresAt to avoid "unused variable" error
 }
 
 func TestPgCachePluginExpiration(t *testing.T) {
-	plugin, cachePlugin, mock := newTestPluginWithCache(t)
-	defer plugin.db.Close()
-
+	_, cachePlugin, mock := newTestPluginWithCache(t)
 	key := "expiredKey"
 
 	// --- Test Get (key expired) ---
-	// Mock the SELECT query for a key considered expired
-	// Mock returns sql.ErrNoRows because the 'expires_at > NOW()' condition would fail
-	mock.ExpectQuery("SELECT value FROM easyrest_cache WHERE key = \\$1 AND expires_at > NOW()").
+	mock.ExpectQuery(`SELECT value FROM easyrest_cache WHERE key = $1 AND expires_at > NOW()`).
 		WithArgs(key).
-		WillReturnError(sql.ErrNoRows)
+		WillReturnError(pgx.ErrNoRows)
 
-	// Call Get for the "expired" key
 	_, err := cachePlugin.Get(key)
-	// Check that sql.ErrNoRows error was returned
+	// Check against sql.ErrNoRows for broader compatibility
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("expected sql.ErrNoRows for expired key, got %v", err)
 	}
-
-	// Check that all mock expectations were met
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unfulfilled expectations in TestPgCachePluginExpiration: %s", err)
+	}
+}
+
+func TestParseConnectionParams_Defaults(t *testing.T) {
+	uri := "postgres://user:pass@host:5432/db"
+	dsn, maxConns, minConns, maxLifetime, maxIdleTime, timeout, bulkThreshold, autoCleanup, err := parseConnectionParams(uri)
+
+	require.NoError(t, err)
+	assert.Equal(t, uri, dsn) // DSN should be unchanged as no params were removed
+	assert.Equal(t, int32(100), maxConns)
+	assert.Equal(t, int32(25), minConns)
+	assert.Equal(t, 5*time.Minute, maxLifetime)
+	assert.Equal(t, 10*time.Minute, maxIdleTime)
+	assert.Equal(t, 30*time.Second, timeout)
+	assert.Equal(t, 100, bulkThreshold)
+	assert.Equal(t, "", autoCleanup)
+}
+
+func TestParseConnectionParams_CustomValues(t *testing.T) {
+	uri := "postgres://user:pass@host:5432/db?maxOpenConns=50&maxIdleConns=10&connMaxLifetime=15&connMaxIdleTime=20&timeout=60&bulkThreshold=500&autoCleanup=true"
+	expectedDSN := "postgres://user:pass@host:5432/db" // Params should be removed
+	dsn, maxConns, minConns, maxLifetime, maxIdleTime, timeout, bulkThreshold, autoCleanup, err := parseConnectionParams(uri)
+
+	require.NoError(t, err)
+	assert.Equal(t, expectedDSN, dsn)
+	assert.Equal(t, int32(50), maxConns)
+	assert.Equal(t, int32(10), minConns)
+	assert.Equal(t, 15*time.Minute, maxLifetime)
+	assert.Equal(t, 20*time.Minute, maxIdleTime)
+	assert.Equal(t, 60*time.Second, timeout)
+	assert.Equal(t, 500, bulkThreshold)
+	assert.Equal(t, "true", autoCleanup)
+}
+
+func TestParseConnectionParams_OnlySomeValues(t *testing.T) {
+	uri := "postgres://user:pass@host:5432/db?maxOpenConns=75&timeout=45"
+	expectedDSN := "postgres://user:pass@host:5432/db"
+	dsn, maxConns, minConns, maxLifetime, maxIdleTime, timeout, bulkThreshold, autoCleanup, err := parseConnectionParams(uri)
+
+	require.NoError(t, err)
+	assert.Equal(t, expectedDSN, dsn)
+	assert.Equal(t, int32(75), maxConns)         // Custom
+	assert.Equal(t, int32(25), minConns)         // Default
+	assert.Equal(t, 5*time.Minute, maxLifetime)  // Default
+	assert.Equal(t, 10*time.Minute, maxIdleTime) // Default
+	assert.Equal(t, 45*time.Second, timeout)     // Custom
+	assert.Equal(t, 100, bulkThreshold)          // Default
+	assert.Equal(t, "", autoCleanup)             // Default
+}
+
+func TestParseConnectionParams_InvalidValues(t *testing.T) {
+	testCases := []struct {
+		name    string
+		uri     string
+		wantErr string
+	}{
+		{"invalid prefix", "http://host/db", "invalid postgres URI"},
+		{"invalid maxOpenConns", "postgres://host/db?maxOpenConns=abc", "invalid maxOpenConns value: abc"},
+		{"invalid maxIdleConns", "postgres://host/db?maxIdleConns=xyz", "invalid maxIdleConns value: xyz"},
+		{"invalid connMaxLifetime", "postgres://host/db?connMaxLifetime=def", "invalid connMaxLifetime value: def"},
+		{"invalid connMaxIdleTime", "postgres://host/db?connMaxIdleTime=ghi", "invalid connMaxIdleTime value: ghi"},
+		{"invalid timeout", "postgres://host/db?timeout=jkl", "invalid timeout value: jkl"},
+		{"invalid bulkThreshold", "postgres://host/db?bulkThreshold=mno", "invalid bulkThreshold value: mno"},
+		{"invalid URL", "postgres://user:%%@host/db", "invalid URL escape"}, // Check url.Parse error
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, _, _, _, _, _, err := parseConnectionParams(tc.uri)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestParseConnectionParams_DSNEncoding(t *testing.T) {
+	uri := "postgres://user%20name:p@ssw%2Frd@host:5432/db%20name?maxOpenConns=50&other=param"
+	// Correct expected DSN with @ encoded as %40
+	expectedDSN := "postgres://user%20name:p%40ssw%2Frd@host:5432/db%20name?other=param"
+	dsn, _, _, _, _, _, _, _, err := parseConnectionParams(uri)
+	require.NoError(t, err)
+	assert.Equal(t, expectedDSN, dsn)
+}
+
+func TestDeleteExpiredCacheEntries(t *testing.T) {
+	_, cachePlugin, mock := newTestPluginWithCache(t)
+
+	// Expect the DELETE query to be executed
+	mock.ExpectExec(`DELETE FROM easyrest_cache WHERE expires_at <= NOW()`).
+		WillReturnResult(pgxmock.NewResult("DELETE", 5)) // Example: Expect 5 rows deleted
+
+	// Call the synchronous cleanup function
+	err := cachePlugin.deleteExpiredEntries(context.Background())
+
+	// Assertions
+	require.NoError(t, err)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations in TestDeleteExpiredCacheEntries: %s", err)
 	}
 }
