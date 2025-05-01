@@ -24,7 +24,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.1"
+var Version = "v0.5.2"
 
 var bgCtx = context.Background()
 
@@ -169,40 +169,6 @@ func (p *pgPlugin) InitConnection(uri string) error {
 	p.timezoneCache = make(map[string]*time.Location) // Initialize cache
 
 	return nil
-}
-
-// getTxPreference extracts the transaction preference ('commit' or 'rollback') from the context.
-// Defaults to 'commit' if not specified. Returns an error for invalid values.
-func getTxPreference(ctx map[string]any) (string, error) {
-	txPreference := "commit" // Default behavior
-	if ctx != nil {
-		// Use type assertion with checking for existence
-		if preferAny, preferExists := ctx["prefer"]; preferExists {
-			// Check if prefer is a map
-			if prefer, ok := preferAny.(map[string]any); ok {
-				// Check if tx exists within prefer
-				if txPrefAny, txPrefExists := prefer["tx"]; txPrefExists {
-					// Check if tx is a string
-					if txPref, ok := txPrefAny.(string); ok && txPref != "" { // Ensure it's a non-empty string
-						// Validate the value
-						if txPref == "commit" || txPref == "rollback" {
-							txPreference = txPref
-						} else {
-							return "", fmt.Errorf("invalid value for prefer.tx: '%s', must be 'commit' or 'rollback'", txPref)
-						}
-					} else if !ok {
-						// If prefer.tx exists but is not a string
-						return "", fmt.Errorf("invalid type for prefer.tx: expected string, got %T", txPrefAny)
-					}
-					// If txPref is an empty string, we keep the default "commit"
-				}
-			} else {
-				// If prefer exists but is not a map[string]any
-				return "", fmt.Errorf("invalid type for prefer: expected map[string]any, got %T", preferAny)
-			}
-		}
-	}
-	return txPreference, nil
 }
 
 // ApplyPluginContext sets session variables using set_config for all keys in ctx.
@@ -389,7 +355,7 @@ func (p *pgPlugin) TableCreate(userID, table string, data []map[string]any, ctx 
 	}
 
 	// Get transaction preference
-	txPreference, err := getTxPreference(ctx)
+	txPreference, err := easyrest.GetTxPreference(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -531,7 +497,7 @@ func (p *pgPlugin) bulkCreate(table string, data []map[string]any, ctx map[strin
 // TableUpdate executes an UPDATE query on the specified table.
 func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where map[string]any, ctx map[string]any) (int, error) {
 	// Get transaction preference
-	txPreference, err := getTxPreference(ctx)
+	txPreference, err := easyrest.GetTxPreference(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -609,7 +575,7 @@ func (p *pgPlugin) TableUpdate(userID, table string, data map[string]any, where 
 // TableDelete executes a DELETE query on the specified table.
 func (p *pgPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
 	// Get transaction preference
-	txPreference, err := getTxPreference(ctx)
+	txPreference, err := easyrest.GetTxPreference(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -673,7 +639,7 @@ func (p *pgPlugin) CallFunction(userID, funcName string, data map[string]any, ct
 	defer cancel()
 
 	// Get transaction preference
-	txPreference, err := getTxPreference(ctx)
+	txPreference, err := easyrest.GetTxPreference(ctx)
 	if err != nil {
 		return nil, err
 	}
