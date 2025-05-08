@@ -24,7 +24,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.2"
+var Version = "v0.5.3"
 
 var bgCtx = context.Background()
 
